@@ -144,6 +144,31 @@ func Run(t *testing.T, factory func(t *testing.T) gateway.Coordinator) {
 		require.NoError(t, unlock(ctx), "a second unlock call must not error")
 	})
 
+	t.Run("unlock never steals a lock a later holder acquired after this holder's ttl expired", func(t *testing.T) {
+		c := factory(t)
+		ctx := context.Background()
+
+		firstUnlock, err := c.TryLock(ctx, "k", 30*time.Millisecond)
+		require.NoError(t, err)
+
+		require.Eventually(t, func() bool {
+			secondUnlock, err := c.TryLock(ctx, "k", 10*time.Second)
+			if err != nil {
+				return false
+			}
+			t.Cleanup(func() { _ = secondUnlock(ctx) })
+			return true
+		}, 3*time.Second, 10*time.Millisecond, "the lock must become acquirable once the first holder's ttl elapses")
+
+		// The first holder's belated unlock call must be a no-op: the second holder's
+		// lock must still be in effect. A bare DEL-based unlock would incorrectly
+		// release it here regardless of which holder set it.
+		require.NoError(t, firstUnlock(ctx))
+
+		_, err = c.TryLock(ctx, "k", 10*time.Second)
+		require.ErrorIs(t, err, gateway.ErrLockNotAcquired, "the second holder's lock must survive the first holder's stale unlock")
+	})
+
 	t.Run("only one of many concurrent TryLock callers wins", func(t *testing.T) {
 		c := factory(t)
 		ctx := context.Background()

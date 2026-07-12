@@ -118,6 +118,23 @@ func TestManagerNoIssuerConfigured(t *testing.T) {
 	require.ErrorIs(t, err, gateway.ErrNoIssuer)
 }
 
+// TestManagerIssuanceLockExpiredDuringIssuance verifies that a CertIssuer call slower
+// than the configured issuance lock TTL surfaces ErrIssuanceLockExpired instead of
+// silently caching a result whose single-issuer guarantee is no longer certain (see
+// WithIssuanceLockTTL).
+func TestManagerIssuanceLockExpiredDuringIssuance(t *testing.T) {
+	system := newTestSystem(t)
+	issuer := &fakeIssuer{ttl: time.Hour, delay: 100 * time.Millisecond}
+	manager := gateway.NewManager(system, log.DiscardLogger,
+		gateway.WithCertIssuer(issuer),
+		gateway.WithIssuanceLockTTL(20*time.Millisecond),
+		gateway.WithRenewInterval(""),
+	)
+
+	_, err := manager.EnsureCertificate(context.Background(), "slow.example.com")
+	require.ErrorIs(t, err, gateway.ErrIssuanceLockExpired)
+}
+
 // TestManagerIssuanceSingleFlight verifies that N concurrent EnsureCertificate calls for
 // the same, previously-unissued domain result in exactly one call to the underlying
 // CertIssuer - the local single-flight dedup layer that sits underneath (and, with a

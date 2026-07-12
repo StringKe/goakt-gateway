@@ -74,4 +74,13 @@ var (
 	// ErrLockNotAcquired is returned by Coordinator.TryLock when the lock is already
 	// held by someone else.
 	ErrLockNotAcquired = errors.New("gateway: lock not acquired")
+
+	// ErrIssuanceLockExpired is returned by Manager when a CertIssuer call outlives the
+	// configured issuance lock TTL (see WithIssuanceLockTTL). The Coordinator lock has no
+	// renewal/heartbeat, so a slow issuer can let the lock expire and a second process
+	// acquire it while the first is still mid-issuance; returning this error instead of
+	// silently caching the result makes that window visible rather than quietly risking a
+	// duplicate CertIssuer call. Configure a WithIssuanceLockTTL comfortably longer than
+	// your CertIssuer's worst-case latency to avoid it.
+	ErrIssuanceLockExpired = errors.New("gateway: certificate issuance took longer than the issuance lock ttl")
 )

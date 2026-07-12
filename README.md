@@ -10,7 +10,9 @@ connection registry with two-tier delivery, and cluster-shared TLS termination
 nginx/caddy front-tier normally plays in front of a stateless HTTP fleet - for two
 things specifically: giving long-lived WebSocket/SSE connections an addressable identity
 so any node can deliver a message to them, and terminating TLS for domains shared
-cluster-wide from a certificate issued exactly once.
+cluster-wide from a certificate arbitrated so that, as long as issuance completes within
+the configured lock TTL, at most one process issues it (see
+[Cluster-shared TLS](#cluster-shared-tls) for the lock-TTL caveat).
 
 ## Why it lives outside the actor core
 
@@ -174,7 +176,9 @@ data.
 ## Cluster-shared TLS
 
 `Manager` lets every process terminate TLS for any hosted domain from one certificate,
-issued exactly once across every process that shares its `Coordinator`:
+with issuance arbitrated across every process that shares its `Coordinator` so that, as
+long as your `CertIssuer` completes within the configured issuance lock TTL, at most one
+process calls it:
 
 ```go
 manager := gateway.NewManager(actorSystem, logger,
@@ -197,6 +201,13 @@ tlsConfig := manager.TLSConfig() // GetCertificate wired for SNI lookup
   finding one close to expiry) races `Coordinator.TryLock` for that domain; only the
   winner calls the configured `CertIssuer`. Losers poll the `Coordinator` until the
   winner publishes, or give up with `ErrIssuanceTimeout`.
+- **Issuance lock TTL caveat.** The lock is not renewed while the `CertIssuer` call is in
+  flight (`Coordinator` has no lock-extension method). If issuance takes longer than
+  `WithIssuanceLockTTL` (default 2 minutes), the lock can expire mid-issuance and a second
+  process can acquire it and also call the issuer. `Manager` detects this after the fact
+  and returns `ErrIssuanceLockExpired` instead of caching the result, but it does not
+  prevent the extra `CertIssuer` call. Set `WithIssuanceLockTTL` comfortably longer than
+  your `CertIssuer`'s worst-case latency.
 - **Distribution.** The issued certificate is written to the `Coordinator` (so every
   process sharing it can serve it immediately) and to the configured `CertStore` (so a
   single-process restart doesn't need the `Coordinator` at all).
@@ -320,10 +331,13 @@ clients land on the replicas that stay up.
   propagation delay this library's own test suite budgets for).
 - Certificate issuance is deduplicated within a process (`singleflight`) and, with a
   shared `Coordinator`, arbitrated across every process sharing it so at most one
-  process calls the configured `CertIssuer` for a given domain at a time.
+  process calls the configured `CertIssuer` for a given domain at a time, **provided
+  issuance completes within the configured issuance lock TTL** (see the lock TTL caveat
+  below).
 - `MemoryCoordinator.TryLock` and `coordinator/redis.Coordinator.TryLock` are both real
   mutual exclusion: an unlock can never release a lock a later caller has since
-  acquired.
+  acquired. This is a shared conformance suite (`coordinator/conformance`), run against
+  both implementations, so a regression to e.g. a bare `DEL` in either would fail tests.
 
 **Does not:**
 
@@ -335,6 +349,12 @@ clients land on the replicas that stay up.
 - Provide its own certificate validation, ACME support, or CA. `CertIssuer` is a seam;
   bring your own (an ACME implementation is a natural third one, deliberately not
   shipped here to keep the dependency tree minimal).
+- Renew the issuance lock while a `CertIssuer` call is in flight. `Coordinator` has no
+  lock-extension method, so if issuance takes longer than `WithIssuanceLockTTL`, the lock
+  can expire mid-issuance and a second process can acquire it and also call the issuer;
+  `Manager` returns `ErrIssuanceLockExpired` after the fact rather than caching the
+  result, but does not prevent the extra call. Set the TTL comfortably longer than your
+  `CertIssuer`'s worst-case latency.
 - Drain in-flight application state on shutdown beyond closing the socket/stream -
   `Drain` terminates connections, it does not flush or persist anything for you.
 

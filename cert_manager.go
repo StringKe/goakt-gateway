@@ -69,10 +69,17 @@ type cachedCert struct {
 
 // Manager terminates TLS for one or more domains from certificates shared across every
 // process that shares its Coordinator: issuance for a given domain is arbitrated
-// through Coordinator.TryLock so exactly one caller invokes the configured CertIssuer,
+// through Coordinator.TryLock so at most one caller invokes the configured CertIssuer,
 // the result is distributed through Coordinator.Put/Get, and a cron renewal schedule
 // (single-fire cluster-wide by GoAkt scheduler design when running in a GoAkt cluster)
 // drives renewal ahead of expiry.
+//
+// The issuance lock is held for at most WithIssuanceLockTTL and is not renewed/extended
+// while a CertIssuer call is outstanding: if issuance takes longer than lockTTL, the lock
+// can expire mid-issuance, letting a second process acquire it and also call the issuer.
+// doEnsure detects this after the fact and returns ErrIssuanceLockExpired instead of
+// caching the result, but the extra CertIssuer call itself is not prevented. Set
+// WithIssuanceLockTTL comfortably longer than your CertIssuer's worst-case latency.
 //
 // Without an explicit WithCoordinator, Manager defaults to a process-local
 // MemoryCoordinator: issuance is still deduplicated (so concurrent handshakes for a cold
@@ -145,7 +152,10 @@ func WithRenewBefore(d time.Duration) ManagerOption {
 }
 
 // WithIssuanceLockTTL sets how long the coordinated issuance lock for a domain is held
-// for. Defaults to 2 minutes; increase it if your CertIssuer can take longer than that.
+// for. Defaults to 2 minutes. The lock is not renewed while the CertIssuer call is in
+// flight, so set this comfortably longer than your CertIssuer's worst-case latency: if
+// issuance overruns it, doEnsure returns ErrIssuanceLockExpired instead of silently
+// caching a result whose single-issuer guarantee is no longer certain.
 func WithIssuanceLockTTL(d time.Duration) ManagerOption {
 	return func(m *Manager) { m.lockTTL = d }
 }
@@ -324,6 +334,7 @@ func (m *Manager) doEnsure(ctx context.Context, domain string, force bool) (*tls
 		}
 		return nil, fmt.Errorf("gateway: failed to acquire issuance lock for %q: %w", domain, err)
 	}
+	lockAcquiredAt := time.Now()
 	defer func() { _ = unlock(context.WithoutCancel(ctx)) }()
 
 	// Someone may have finished issuing between our pre-lock read and acquiring the
@@ -337,6 +348,15 @@ func (m *Manager) doEnsure(ctx context.Context, domain string, force bool) (*tls
 	tlsCert, cert, err := m.issue(ctx, domain)
 	if err != nil {
 		return nil, err
+	}
+
+	// The Coordinator lock has no renewal/heartbeat: if the issuer call outlived
+	// lockTTL, the lock may already have expired and a second process may already be
+	// issuing (or have issued) concurrently. Surface that instead of silently caching a
+	// result whose single-issuer guarantee is no longer certain.
+	if elapsed := time.Since(lockAcquiredAt); elapsed >= m.lockTTL {
+		return nil, fmt.Errorf("gateway: issuance for %q took %s, exceeding the %s issuance lock ttl: %w",
+			domain, elapsed, m.lockTTL, ErrIssuanceLockExpired)
 	}
 
 	if err := m.store.Put(ctx, cert); err != nil {
