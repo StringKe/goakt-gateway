@@ -28,6 +28,7 @@ package gateway
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -43,8 +44,8 @@ import (
 // WithOwnerLease exists to close: two Registries backed by two entirely separate, non-clustered
 // actor systems - so their actor directories give each other zero exclusion, exactly the "both
 // nodes observe no owner and both Spawn" failure mode a PA/EC cluster directory can produce -
-// race Register for the very same connection id. Only the CASCoordinator lease they share can
-// arbitrate this, and it must let exactly one of them win.
+// race Register for the very same connection id. Only the linearizable fencing lease they
+// share can arbitrate this, and it must let exactly one of them win.
 func TestOwnerLeaseConcurrentRegisterAcrossTwoNodesHasSingleOwner(t *testing.T) {
 	systemA := newRaceTestSystem(t)
 	systemB := newRaceTestSystem(t)
@@ -170,7 +171,8 @@ func TestConnHandleUnregisterHandleDoesNotClobberTakeover(t *testing.T) {
 
 // TestWithOwnerLeaseUnsupportedCoordinatorFailsRegister proves NewRegistry's lack of an error
 // return does not silently drop WithOwnerLease being misconfigured: a Coordinator that does not
-// implement CASCoordinator must fail every subsequent Register with ErrOwnerLeaseUnsupported.
+// implement LinearizableFencingCoordinator must fail every subsequent Register with
+// ErrOwnerLeaseUnsupported.
 func TestWithOwnerLeaseUnsupportedCoordinatorFailsRegister(t *testing.T) {
 	system := newRaceTestSystem(t)
 	registry := NewRegistry(system, log.DiscardLogger, WithOwnerLease(nonCASCoordinator{}))
@@ -179,6 +181,55 @@ func TestWithOwnerLeaseUnsupportedCoordinatorFailsRegister(t *testing.T) {
 	err := registry.Register(context.Background(), "unsupported-conn", func([]byte) error { return nil })
 	require.ErrorIs(t, err, ErrOwnerLeaseUnsupported)
 	require.Equal(t, 0, registry.Len())
+}
+
+// TestWithOwnerLeaseCASOnlyCoordinatorFailsRegister verifies that atomic CAS by itself is not
+// accepted as strict ownership fencing. A provider must explicitly declare a linearizable order
+// across all participating processes before WithOwnerLease can use it.
+func TestWithOwnerLeaseCASOnlyCoordinatorFailsRegister(t *testing.T) {
+	system := newRaceTestSystem(t)
+	registry := NewRegistry(system, log.DiscardLogger, WithOwnerLease(newCASOnlyCoordinator()))
+	t.Cleanup(func() { _ = registry.Close(context.Background()) })
+
+	err := registry.Register(context.Background(), "cas-only-conn", func([]byte) error { return nil })
+	require.ErrorIs(t, err, ErrOwnerLeaseUnsupported)
+	require.Equal(t, 0, registry.Len())
+}
+
+// TestOwnerLeaseCoordinatorGetFailureRejectsEveryLocalDeliveryPath verifies strict ownership
+// fails closed. sendTo is the delivery method connActor.Receive uses after resolving its local
+// connection, so covering it verifies the actor path without constructing an actor context.
+func TestOwnerLeaseCoordinatorGetFailureRejectsEveryLocalDeliveryPath(t *testing.T) {
+	system := newRaceTestSystem(t, actor.WithPubSub())
+	coord := &failingGetFencingCoordinator{MemoryCoordinator: NewMemoryCoordinator()}
+	registry := NewRegistry(system, log.DiscardLogger, WithOwnerLease(coord))
+	t.Cleanup(func() { _ = registry.Close(context.Background()) })
+
+	const id = "owner-get-failure-conn"
+	const group = "owner-get-failure-group"
+	const topic = "owner-get-failure-topic"
+	var delivered atomic.Int64
+	require.NoError(t, registry.Register(context.Background(), id, func([]byte) error {
+		delivered.Add(1)
+		return nil
+	}, WithConnGroup(group), WithConnTopics(topic)))
+
+	coord.failGet.Store(true)
+
+	err := registry.SendToConnection(context.Background(), id, []byte("direct"))
+	require.ErrorIs(t, err, ErrStaleOwner)
+
+	groupResult, err := registry.SendToGroup(context.Background(), group, []byte("group"))
+	require.NoError(t, err)
+	require.Equal(t, DeliveryResult{Dropped: 1}, groupResult)
+
+	broadcastResult, err := registry.Broadcast(context.Background(), topic, []byte("broadcast"))
+	require.NoError(t, err)
+	require.Equal(t, DeliveryResult{Dropped: 1}, broadcastResult)
+
+	err = registry.sendTo(context.Background(), id, []byte("actor"))
+	require.ErrorIs(t, err, ErrStaleOwner)
+	require.Zero(t, delivered.Load())
 }
 
 // TestOwnerLeaseStaleLocalEntryRejectsLocalDelivery is the P0-1 regression: a local entry whose
@@ -384,3 +435,89 @@ func (nonCASCoordinator) TryLock(context.Context, string, time.Duration) (func(c
 }
 
 var _ Coordinator = nonCASCoordinator{}
+
+// casOnlyCoordinator has atomic CAS but deliberately makes no linearizable fencing claim.
+// This models a replicated backend whose asynchronous failover can discard an acknowledged CAS.
+type casOnlyCoordinator struct {
+	inner *MemoryCoordinator
+}
+
+func newCASOnlyCoordinator() *casOnlyCoordinator {
+	return &casOnlyCoordinator{inner: NewMemoryCoordinator()}
+}
+
+func (c *casOnlyCoordinator) Get(ctx context.Context, key string) ([]byte, bool, error) {
+	return c.inner.Get(ctx, key)
+}
+
+func (c *casOnlyCoordinator) Put(ctx context.Context, key string, value []byte, ttl time.Duration) error {
+	return c.inner.Put(ctx, key, value, ttl)
+}
+
+func (c *casOnlyCoordinator) TryLock(ctx context.Context, key string, ttl time.Duration) (func(context.Context) error, error) {
+	return c.inner.TryLock(ctx, key, ttl)
+}
+
+func (c *casOnlyCoordinator) CompareAndSwap(ctx context.Context, key string, expected, newValue []byte, ttl time.Duration) (bool, error) {
+	return c.inner.CompareAndSwap(ctx, key, expected, newValue, ttl)
+}
+
+var _ CASCoordinator = (*casOnlyCoordinator)(nil)
+
+// failingGetFencingCoordinator is a linearizable test double that can make only ownership
+// reads fail after registration, isolating delivery's fail-closed contract.
+type failingGetFencingCoordinator struct {
+	*MemoryCoordinator
+	failGet atomic.Bool
+}
+
+func (c *failingGetFencingCoordinator) Get(ctx context.Context, key string) ([]byte, bool, error) {
+	if c.failGet.Load() {
+		return nil, false, errInjectedOwnerLeaseGet
+	}
+	return c.MemoryCoordinator.Get(ctx, key)
+}
+
+func (*failingGetFencingCoordinator) LinearizableFencing() {}
+
+var (
+	errInjectedOwnerLeaseGet                                = errors.New("injected owner lease get failure")
+	_                        LinearizableFencingCoordinator = (*failingGetFencingCoordinator)(nil)
+)
+
+// failingAdvanceOutbox makes registration fail after the actor has been spawned but before
+// traffic can be opened, exercising the rollback boundary around AdvanceGeneration.
+type failingAdvanceOutbox struct {
+	*MemoryOutbox
+}
+
+func (*failingAdvanceOutbox) AdvanceGeneration(context.Context, string, uint64) error {
+	return errInjectedAdvanceGeneration
+}
+
+var (
+	errInjectedAdvanceGeneration                          = errors.New("injected advance generation failure")
+	_                            OutboxGenerationAdvancer = (*failingAdvanceOutbox)(nil)
+)
+
+// TestOwnerLeaseAdvanceGenerationFailureRollsBackRegistration verifies an outbox fencing
+// failure leaves no locally reachable entry or actor-backed delivery path.
+func TestOwnerLeaseAdvanceGenerationFailureRollsBackRegistration(t *testing.T) {
+	system := newRaceTestSystem(t)
+	registry := NewRegistry(system, log.DiscardLogger,
+		WithOwnerLease(NewMemoryCoordinator()),
+		WithOutbox(&failingAdvanceOutbox{MemoryOutbox: NewMemoryOutbox()}),
+	)
+	t.Cleanup(func() { _ = registry.Close(context.Background()) })
+
+	var delivered atomic.Int64
+	err := registry.Register(context.Background(), "advance-failure-conn", func([]byte) error {
+		delivered.Add(1)
+		return nil
+	})
+	require.ErrorIs(t, err, errInjectedAdvanceGeneration)
+	require.False(t, registry.Has("advance-failure-conn"))
+	require.Equal(t, 0, registry.Len())
+	require.ErrorIs(t, registry.SendToConnection(context.Background(), "advance-failure-conn", []byte("must-not-deliver")), ErrConnectionNotFound)
+	require.Zero(t, delivered.Load())
+}

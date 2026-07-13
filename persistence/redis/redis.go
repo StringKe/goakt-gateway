@@ -143,17 +143,16 @@ return 1
 `)
 
 // advanceGenerationScript is gateway.OutboxGenerationAdvancer.AdvanceGeneration's atomic
-// implementation: a no-op when generation is not strictly greater than the floor already
-// recorded, and otherwise raises it without touching any message. Unlike ackScript it does not
-// gate on the key already existing: this is called by Registry itself for a connection id it is
-// actually registering (see gateway.WithOwnerLease), not by attacker-reachable input, so creating
-// the hash ahead of its first Append is safe - and, exactly like appendScript, it re-arms the
-// key's TTL when one is configured so a connection that advances its generation but never sends
-// anything through this Outbox still gets reclaimed rather than lingering forever.
+// implementation: a no-op when the connection has no Outbox state or the generation is not
+// strictly greater than the floor already recorded. Owner registration must not create an empty
+// Redis hash solely for fencing.
 //
 // KEYS[1] connection key. ARGV[1] generation (decimal string), ARGV[2] reserved ack generation
 // field, ARGV[3] ttl in milliseconds (0 for no expiry).
 var advanceGenerationScript = goredis.NewScript(`
+if redis.call("EXISTS", KEYS[1]) == 0 then
+	return 0
+end
 local floor = redis.call("HGET", KEYS[1], ARGV[2])
 if not floor or tonumber(ARGV[1]) > tonumber(floor) then
 	redis.call("HSET", KEYS[1], ARGV[2], ARGV[1])

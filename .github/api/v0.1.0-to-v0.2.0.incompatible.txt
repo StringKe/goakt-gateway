@@ -1,0 +1,11 @@
+- (*Registry).Broadcast: changed from func(context.Context, string, []byte) error to func(context.Context, string, []byte, ...BroadcastOption) (DeliveryResult, error)
+- (*Registry).Register: changed from func(context.Context, string, func([]byte) error, ...string) error to func(context.Context, string, func([]byte) error, ...RegisterOption) error
+- NewRegistry: changed from func(github.com/tochemey/goakt/v4/actor.ActorSystem, github.com/tochemey/goakt/v4/log.Logger) *Registry to func(github.com/tochemey/goakt/v4/actor.ActorSystem, github.com/tochemey/goakt/v4/log.Logger, ...RegistryOption) *Registry
+- WithSSEAuthFunc: removed
+- WithSSEOnConnect: changed from func(func(ctx context.Context, id string, r *net/http.Request)) SSEHandlerOption to func(func(ctx context.Context, info *ConnInfo, r *net/http.Request)) SSEHandlerOption
+- WithSSEOnDisconnect: changed from func(func(id string)) SSEHandlerOption to func(func(info *ConnInfo)) SSEHandlerOption
+- WithWSAuthFunc: removed
+- WithWSOnConnect: changed from func(func(ctx context.Context, id string, r *net/http.Request)) WSHandlerOption to func(func(ctx context.Context, info *ConnInfo, r *net/http.Request)) WSHandlerOption
+- WithWSOnDisconnect: changed from func(func(id string)) WSHandlerOption to func(func(info *ConnInfo)) WSHandlerOption
+- WithWSOnMessage: changed from func(func(ctx context.Context, id string, payload []byte)) WSHandlerOption to func(func(ctx context.Context, info *ConnInfo, payload []byte)) WSHandlerOption
+- ./coordinator/redis.New: changed from func(github.com/redis/go-redis/v9.Cmdable, ...Option) *Coordinator to func(github.com/redis/go-redis/v9.UniversalClient, ...Option) *Coordinator

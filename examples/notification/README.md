@@ -72,9 +72,9 @@ still a single process - see the caveat above):
 REDIS_ADDR=127.0.0.1:6379 go run ./examples/notification
 ```
 
-`presence/redis` is one of four interchangeable Redis / Valkey backends this library ships
-(`coordinator/redis`, `presence/redis`, `store/redis`, `ssehistory/redis`). A real
-deployment can point all four at one Redis or Valkey instance and keep their keys apart
+`presence/redis` is one of five interchangeable Redis / Valkey backends this library ships
+(`coordinator/redis`, `presence/redis`, `store/redis`, `ssehistory/redis`, `persistence/redis`). A real
+deployment can point all five at one Redis or Valkey instance and keep their keys apart
 with distinct `WithKeyPrefix` namespaces - presence here uses the package default; the
 other three are demonstrated in the `tls-cloudflare` and `sse-resume` examples. Either a
 Redis or a Valkey server works unchanged; the repo-root `docker-compose.yml` starts one of

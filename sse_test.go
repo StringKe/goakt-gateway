@@ -35,6 +35,7 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/stretchr/testify/require"
 
@@ -71,6 +72,95 @@ func TestSSEHandlerDelivery(t *testing.T) {
 	require.Equal(t, "hello", frame.data)
 	require.Equal(t, "sse-1-1", frame.id)
 	require.Empty(t, frame.event)
+}
+
+func TestSSEHandlerOutboxEnvelopeReplaysAndAcksBinaryPayload(t *testing.T) {
+	system := newTestSystem(t)
+	outbox := gateway.NewMemoryOutbox()
+	registry := gateway.NewRegistry(system, log.DiscardLogger, gateway.WithOutbox(outbox), gateway.WithOutboxEnvelope())
+	t.Cleanup(func() { _ = registry.Close(context.Background()) })
+
+	handler := gateway.NewSSEHandler(registry,
+		gateway.WithSSEIDFunc(func(r *http.Request) string { return r.URL.Query().Get("id") }),
+		gateway.WithSSEKeepAlive(time.Hour),
+	)
+	server := httptest.NewServer(handler)
+	defer server.Close()
+
+	const id = "outbox-sse"
+	wantPayload := []byte{0x00, 0x0A, 0xFF, 0x3A}
+	first, cancelFirst := openSSEStream(t, server.URL+"/?id="+id, "")
+	defer cancelFirst()
+	defer func() { _ = first.Body.Close() }()
+	require.Eventually(t, func() bool { return registry.Has(id) }, 3*time.Second, 20*time.Millisecond)
+
+	require.NoError(t, registry.SendToConnection(context.Background(), id, wantPayload))
+	firstFrame, err := readSSEFrame(bufio.NewReader(first.Body))
+	require.NoError(t, err)
+	require.True(t, utf8.ValidString(firstFrame.data))
+	msgID, seq, payload, err := gateway.DecodeOutboxTextEnvelope([]byte(firstFrame.data))
+	require.NoError(t, err)
+	require.Equal(t, wantPayload, payload)
+
+	second, cancelSecond := openSSEStream(t, server.URL+"/?id="+id, "")
+	defer cancelSecond()
+	defer func() { _ = second.Body.Close() }()
+	secondFrame, err := readSSEFrame(bufio.NewReader(second.Body))
+	require.NoError(t, err)
+	require.True(t, utf8.ValidString(secondFrame.data))
+	replayID, replaySeq, replayPayload, err := gateway.DecodeOutboxTextEnvelope([]byte(secondFrame.data))
+	require.NoError(t, err)
+	require.Equal(t, msgID, replayID)
+	require.Equal(t, seq, replaySeq)
+	require.Equal(t, wantPayload, replayPayload)
+
+	require.NoError(t, registry.Ack(context.Background(), id, msgID))
+	unacked, err := outbox.Unacked(context.Background(), id)
+	require.NoError(t, err)
+	require.Empty(t, unacked)
+}
+
+type sharedNonGenerationalHistory struct {
+	inner gateway.SSEHistory
+}
+
+func (h *sharedNonGenerationalHistory) Append(ctx context.Context, connID, eventID string, payload []byte) error {
+	return h.inner.Append(ctx, connID, eventID, payload)
+}
+
+func (h *sharedNonGenerationalHistory) Since(ctx context.Context, connID, lastEventID string) ([]gateway.SSEEvent, error) {
+	return h.inner.Since(ctx, connID, lastEventID)
+}
+
+func (*sharedNonGenerationalHistory) SharedSSEHistory() {}
+
+func TestSSEHandlerRejectsSharedHistoryWithoutFencing(t *testing.T) {
+	request := httptest.NewRequest(http.MethodGet, "http://gateway.test/sse", nil)
+
+	t.Run("owner lease required", func(t *testing.T) {
+		system := newTestSystem(t)
+		registry := gateway.NewRegistry(system, log.DiscardLogger)
+		handler := gateway.NewSSEHandler(registry,
+			gateway.WithSSEHistory(&sharedNonGenerationalHistory{inner: gateway.NewMemorySSEHistory(4)}),
+		)
+		recorder := httptest.NewRecorder()
+		handler.ServeHTTP(recorder, request)
+		require.Equal(t, http.StatusInternalServerError, recorder.Code)
+		require.Equal(t, gateway.ErrSSESharedHistoryRequiresOwnerLease.Error()+"\n", recorder.Body.String())
+	})
+
+	t.Run("generational history required", func(t *testing.T) {
+		system := newTestSystem(t)
+		registry := gateway.NewRegistry(system, log.DiscardLogger, gateway.WithOwnerLease(gateway.NewMemoryCoordinator()))
+		t.Cleanup(func() { _ = registry.Close(context.Background()) })
+		handler := gateway.NewSSEHandler(registry,
+			gateway.WithSSEHistory(&sharedNonGenerationalHistory{inner: gateway.NewMemorySSEHistory(4)}),
+		)
+		recorder := httptest.NewRecorder()
+		handler.ServeHTTP(recorder, request)
+		require.Equal(t, http.StatusInternalServerError, recorder.Code)
+		require.Equal(t, gateway.ErrSSESharedHistoryRequiresGenerationalHistory.Error()+"\n", recorder.Body.String())
+	})
 }
 
 // TestSSEHandlerAuthResolvesConnInfo verifies the identity resolved by SSEAuthFunc is what
@@ -373,7 +463,8 @@ func TestSSEHandlerDrainWaitsForRegistryUnregisterBeforeReturning(t *testing.T) 
 type generationalHistory struct {
 	inner gateway.SSEHistory
 
-	staleAt string
+	staleAt    string
+	advanceErr error
 
 	mu          sync.Mutex
 	generations []uint64
@@ -410,7 +501,13 @@ func (h *generationalHistory) AdvanceGeneration(_ context.Context, _ string, gen
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	h.advances = append(h.advances, generation)
-	return nil
+	return h.advanceErr
+}
+
+func (h *generationalHistory) setAdvanceErr(err error) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.advanceErr = err
 }
 
 func (h *generationalHistory) recordedGenerations() []uint64 {
@@ -543,6 +640,44 @@ func TestSSEHandlerOpenAdvancesHistoryGenerationOnTakeover(t *testing.T) {
 
 	advances := history.recordedAdvances()
 	require.Greater(t, advances[1], advances[0], "a takeover must advance the history floor to a strictly higher generation")
+}
+
+func TestSSEHandlerOpenRollsBackOnGenerationAdvanceError(t *testing.T) {
+	system := newTestSystem(t)
+	registry := gateway.NewRegistry(system, log.DiscardLogger, gateway.WithOwnerLease(gateway.NewMemoryCoordinator()))
+	t.Cleanup(func() { _ = registry.Close(context.Background()) })
+
+	const id = "advance-generation-failure"
+	history := &generationalHistory{
+		inner:      gateway.NewMemorySSEHistory(16),
+		advanceErr: errors.New("history unavailable"),
+	}
+	handler := gateway.NewSSEHandler(registry,
+		gateway.WithSSEIDFunc(func(r *http.Request) string { return r.URL.Query().Get("id") }),
+		gateway.WithSSEHistory(history),
+		gateway.WithSSEKeepAlive(time.Hour),
+	)
+
+	recorder := httptest.NewRecorder()
+	handler.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "http://gateway.test/sse?id="+id, nil))
+	require.Equal(t, http.StatusInternalServerError, recorder.Code)
+	require.Equal(t, "registration failed\n", recorder.Body.String())
+	require.False(t, registry.Has(id), "a failed generation advance must not leave a writable Registry connection")
+	require.Equal(t, 0, registry.Len(), "a failed generation advance must remove the Registry entry")
+
+	history.setAdvanceErr(nil)
+	server := httptest.NewServer(handler)
+	defer server.Close()
+
+	resp, cancel := openSSEStream(t, server.URL+"/?id="+id, "")
+	defer cancel()
+	defer func() { _ = resp.Body.Close() }()
+	require.Eventually(t, func() bool { return registry.Has(id) }, 3*time.Second, 20*time.Millisecond,
+		"the failed session must be removed so the same id can register again")
+	require.NoError(t, registry.SendToConnection(context.Background(), id, []byte("live")))
+	frame, err := readSSEFrame(bufio.NewReader(resp.Body))
+	require.NoError(t, err)
+	require.Equal(t, "live", frame.data)
 }
 
 // ttlTrackingHistory wraps a real SSEHistory and also implements the optional RefreshTTL

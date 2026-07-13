@@ -225,6 +225,22 @@ func TestStaticIssuer(t *testing.T) {
 		require.Equal(t, "b.example.com", got2.Domain)
 	})
 
+	t.Run("owns issued certificate material", func(t *testing.T) {
+		cert.CertPEM[0] = 'X'
+		cert.KeyPEM[0] = 'X'
+		first, err := issuer.Issue(context.Background(), "a.example.com")
+		require.NoError(t, err)
+		require.NotEqual(t, byte('X'), first.CertPEM[0])
+		require.NotEqual(t, byte('X'), first.KeyPEM[0])
+
+		first.CertPEM[0] = 'Y'
+		first.KeyPEM[0] = 'Y'
+		second, err := issuer.Issue(context.Background(), "a.example.com")
+		require.NoError(t, err)
+		require.NotEqual(t, byte('Y'), second.CertPEM[0])
+		require.NotEqual(t, byte('Y'), second.KeyPEM[0])
+	})
+
 	t.Run("rejects a domain it was not configured for", func(t *testing.T) {
 		_, err := issuer.Issue(context.Background(), "unconfigured.example.com")
 		require.Error(t, err)

@@ -5,20 +5,27 @@ on:
     branches: [main]
   pull_request:
 
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   # No Redis/Valkey service: exercises build, static checks, and the pure-Go tests.
-  # The four RESP conformance suites self-skip without TEST_REDIS_ADDR, so this job
+  # The five RESP conformance suites self-skip without TEST_REDIS_ADDR, so this job
   # deliberately does not cover them - the integration job below does.
   build:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
 
-      # go-version-file keeps the toolchain pinned to the `go` directive in go.mod,
-      # so CI can never drift from the version the module declares.
-      - uses: actions/setup-go@v5
+      # The repository quality contract uses this exact Go version.
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff
         with:
-          go-version-file: go.mod
+          go-version: "1.26.5"
 
       - name: gofmt
         run: |
@@ -29,14 +36,41 @@ jobs:
             exit 1
           fi
 
+      - name: Verify module
+        run: |
+          go mod verify
+          go mod tidy -diff
+
       - name: Build
         run: go build ./...
 
       - name: Vet
         run: go vet ./...
 
-      - name: Test
-        run: go test -race -count=1 ./...
+      - name: actionlint
+        run: go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.12 .github/workflows/*.yml
+
+      - name: golangci-lint
+        run: go run github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.12.2 run ./...
+
+      - name: govulncheck
+        run: go run golang.org/x/vuln/cmd/govulncheck@v1.6.0 ./...
+
+      - name: Test with coverage
+        run: |
+          go test -race -count=1 -covermode=atomic -coverprofile=coverage.out ./...
+          total=$(go tool cover -func=coverage.out | awk '/^total:/{gsub("%", "", $3); print $3}')
+          test -n "$total"
+          awk -v total="$total" 'BEGIN { exit !(total >= 18) }'
+
+      - name: Upload coverage
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: coverage
+          path: coverage.out
+          if-no-files-found: error
+          retention-days: 14
 
   # Redis and Valkey run side by side on different host ports (mirroring
   # docker-compose.yml), so the RESP conformance suites run once against each. Without
@@ -44,9 +78,10 @@ jobs:
   # claim would go unverified.
   integration:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     services:
       redis:
-        image: redis:7
+        image: redis@sha256:6ab0b6e7381779332f97b8ca76193e45b0756f38d4c0dcda72dbb3c32061ab99
         ports:
           - 6399:6379
         options: >-
@@ -55,7 +90,7 @@ jobs:
           --health-timeout 3s
           --health-retries 10
       valkey:
-        image: valkey/valkey:8
+        image: valkey/valkey@sha256:cfe71288f087704b06be45e270afa7a2abbf820093d6b11a23762081f5ff321d
         ports:
           - 6400:6379
         options: >-
@@ -64,11 +99,11 @@ jobs:
           --health-timeout 3s
           --health-retries 10
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
 
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff
         with:
-          go-version-file: go.mod
+          go-version: "1.26.5"
 
       - name: Test against Redis
         env:

@@ -6,9 +6,10 @@ This project is pre-1.0. Breaking changes are expected and are not softened with
 compatibility shims: there is one right way to call each API, and the old way is removed
 rather than deprecated.
 
-## Unreleased
+## v0.2.0
 
-The first substantial reshaping of the connection API since the initial release. Every
+The next release is `v0.2.0`. It contains the first substantial reshaping of the connection
+API since the initial release. Every
 breaking change below exists to close a real gap: connection identity was not addressable
 as a *person* (only as a socket), fan-out could not tell a caller whether anything actually
 happened, and the WebSocket layer was built on an unmaintained library.
@@ -217,9 +218,8 @@ Ack(ctx context.Context, connID, msgID string, generation uint64) error
 ```
 
 `Append` now mints `msgID` itself instead of taking a caller-supplied one, and returns it
-alongside the assigned `Seq` - a prerequisite for a future wire envelope carrying both back to
-the client (see `EncodeOutboxEnvelope`/`DecodeOutboxEnvelope`, not yet wired into any send
-path). `Ack` gained a `generation` parameter so a stale node's `Ack` (see `WithOwnerLease`
+alongside the assigned `Seq` - used by `WithOutboxEnvelope` to carry both back to the
+client. `Ack` gained a `generation` parameter so a stale node's `Ack` (see `WithOwnerLease`
 below) can be fenced instead of accepted; pass `0` if you do not use `WithOwnerLease`.
 
 ### Added
@@ -274,8 +274,8 @@ below) can be fenced instead of accepted; pass `0` if you do not use `WithOwnerL
   behaviour `MemorySSEHistory` gives, whose buffers are never reclaimed on a timer.
 - **`store/conformance` and `ssehistory/conformance`** - shared assertion suites (mirroring
   `coordinator/conformance` and `presence/conformance`) run against both the in-memory and
-  the RESP implementation of each abstraction. All four RESP backends
-  (`coordinator/redis`, `presence/redis`, `store/redis`, `ssehistory/redis`) are verified
+  the RESP implementation of each abstraction. All five RESP backends
+  (`coordinator/redis`, `presence/redis`, `store/redis`, `ssehistory/redis`, `persistence/redis`) are verified
   against both a real Redis server and a real Valkey server; a root `docker-compose.yml`
   starts one of each for local runs.
 - **`WithServerErrorLog`** - route `http.Server`'s error log somewhere you control, so
@@ -315,10 +315,10 @@ of it sees identical behavior to before.
   `NewMemoryOutbox()` (process-local), and `persistence/redis` (a fifth RESP backend, HASH per
   connection with reserved sequence/ack-generation fields). `Registry.Ack` is a no-op
   returning nil with no `Outbox`. At-least-once means duplicates are possible; clients dedupe
-  on `ID`/`Seq`. Boundary: `SendToConnection` does not put `msgID`/`Seq` on the wire itself
-  (see "Strict multi-instance correctness" below and the README's "Persistence and
-  at-least-once delivery" section for the gap this leaves on first delivery, closed only for
-  reconnect redelivery via `Outbox.Unacked`).
+  on `ID`/`Seq`. `WithOutboxEnvelope` makes real-time delivery and reconnect replay use the
+  same ASCII base64 frame containing the message ID, sequence, and original payload. Without
+  `WithOutboxEnvelope`, both paths deliver the original raw payload and the application owns
+  any acknowledgement framing.
 - **`Registry.WatchPresence` / `Registry.GroupMembers`** - optional presence capabilities
   discovered by type assertion. New `PresenceWatcher`, `PresenceDirectory`,
   `PresenceMetaJoiner` interfaces, `PresenceEvent`/`PresenceEntry`/`PresenceEventKind`
@@ -349,9 +349,12 @@ of it sees identical behavior to before.
 - **`WithOwnerLease(c)`** - strict multi-instance connection ownership. The GoAkt actor
   directory is PA/EC eventually consistent, so two nodes can race `Register` for the same
   connection id, both observe no owner, and both succeed (split brain); `WithOwnerLease`
-  closes that window with a CAS-arbitrated lease (`c` must implement the new
-  `CASCoordinator`, which `MemoryCoordinator` and `coordinator/redis.Coordinator` both do) and
-  a monotonically increasing generation every takeover bumps. Every fencing-aware operation -
+  closes that window with a CAS-arbitrated lease. `c` must implement the new
+  `LinearizableFencingCoordinator`: `MemoryCoordinator` supplies it for one process, while
+  `coordinator/redis.Coordinator` intentionally does not because asynchronous-replication
+  failover cannot provide strict fencing. Multi-instance strict ownership requires a
+  consensus-backed provider. Every takeover bumps a monotonically increasing generation.
+  Every fencing-aware operation -
   every local delivery path (`SendToConnection`, `SendToGroup`, `Broadcast`) and the
   cross-node `connActor` delivery check, background lease renewal, `Presence` `Refresh`/`Leave`
   (`PresenceFencer`, implemented by `MemoryPresence` and `presence/redis`), SSE history append
@@ -366,14 +369,14 @@ of it sees identical behavior to before.
   `WithOwnerLease` (the default) a `Registry` keeps its current single-instance semantics at
   zero cost, mirroring the `WithDeliveryConfirmation` opt-in precedent. New errors
   `ErrStaleOwner`, `ErrOwnerHeld`, `ErrOwnerLeaseUnsupported`. New optional interfaces
-  `CASCoordinator` (`coordinator.go`), `GenerationalHistory` (`sse_history.go`),
+  `CASCoordinator` and `LinearizableFencingCoordinator` (`coordinator.go`), `GenerationalHistory` (`sse_history.go`),
   `OutboxGenerationAdvancer` (`persistence.go`), and `PresenceFencer` (`presence.go`).
 
 ### Changed
 
 - `coordinator/redis.New` now takes a `redis.UniversalClient` instead of a
   `redis.Cmdable`, matching `presence/redis`, `store/redis`, and `ssehistory/redis`. All
-  four RESP backends now share one constructor shape, so a single
+  five RESP backends now share one constructor shape, so a single
   `redis.NewUniversalClient(...)` (standalone, Cluster, Sentinel, or Ring) can back every
   one of them. A `*redis.Client` already satisfies `UniversalClient`, so existing
   standalone callers need no change.

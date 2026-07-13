@@ -66,9 +66,8 @@ type Coordinator interface {
 // CASCoordinator is an optional Coordinator extension that adds an atomic
 // compare-and-swap primitive. Implementations opt in by satisfying this interface (checked
 // with a type assertion, not embedded in Coordinator) so existing third-party Coordinator
-// implementations keep compiling unchanged; features that require it (e.g. WithOwnerLease)
-// fail fast with ErrOwnerLeaseUnsupported when the configured Coordinator does not
-// implement it.
+// implementations keep compiling unchanged. Features that need stronger guarantees can
+// require an additional optional capability without changing this base contract.
 //
 // CompareAndSwap shares its key space with Get/Put: the "current value" a CAS call
 // compares against, and the value a successful CAS leaves behind, are exactly what Get
@@ -82,6 +81,19 @@ type CASCoordinator interface {
 	// expired; a non-nil expected requires an exact byte-for-byte match against the
 	// existing value. A failed comparison is not an error: it returns (false, nil).
 	CompareAndSwap(ctx context.Context, key string, expected, newValue []byte, ttl time.Duration) (bool, error)
+}
+
+// LinearizableFencingCoordinator explicitly declares that Get and CompareAndSwap provide a
+// single, linearizable order across every process that uses the Coordinator. WithOwnerLease
+// requires this capability: atomic CAS alone is insufficient when a replicated backend can
+// acknowledge a write and later fail over to a replica that never observed it.
+//
+// LinearizableFencing is a marker method so implementations must make this guarantee
+// deliberately. It has no runtime work; its presence is the provider's public contract.
+type LinearizableFencingCoordinator interface {
+	CASCoordinator
+
+	LinearizableFencing()
 }
 
 // MemoryCoordinator is the default, in-process Coordinator. It is appropriate for a
@@ -107,8 +119,9 @@ type memLock struct {
 
 // enforce compilation error
 var (
-	_ Coordinator    = (*MemoryCoordinator)(nil)
-	_ CASCoordinator = (*MemoryCoordinator)(nil)
+	_ Coordinator                    = (*MemoryCoordinator)(nil)
+	_ CASCoordinator                 = (*MemoryCoordinator)(nil)
+	_ LinearizableFencingCoordinator = (*MemoryCoordinator)(nil)
 )
 
 // NewMemoryCoordinator creates an empty MemoryCoordinator.
@@ -118,6 +131,11 @@ func NewMemoryCoordinator() *MemoryCoordinator {
 		locks:   make(map[string]memLock),
 	}
 }
+
+// LinearizableFencing declares that MemoryCoordinator serializes Get and CompareAndSwap under
+// one process-wide mutex. It is therefore suitable for strict OwnerLease fencing only within
+// that process.
+func (*MemoryCoordinator) LinearizableFencing() {}
 
 // Get implements Coordinator.
 func (m *MemoryCoordinator) Get(_ context.Context, key string) ([]byte, bool, error) {

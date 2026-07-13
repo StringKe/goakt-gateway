@@ -132,7 +132,9 @@ recorded it - so a client that reconnects to a *different* node has no history t
 Set `REDIS_ADDR` and the sample instead runs **two nodes in one process** (node A on
 `:8080`, node B on `:8081`), each with its own actor system and `Registry`, both wired to
 one shared `ssehistory/redis.History`. The shared backend is what lets a connection
-recorded on one node be replayed by the other.
+recorded on one node be replayed by the other. The sample also shares an owner lease
+coordinator between its two registries. Shared replay requires both `WithOwnerLease` and a
+`GenerationalHistory`; the handler rejects a shared history without that fencing boundary.
 
 `docker-compose.yml` in the repo root starts a Redis and a Valkey; either works, because
 `ssehistory/redis` uses only commands both implement:

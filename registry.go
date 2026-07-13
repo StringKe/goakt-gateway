@@ -199,11 +199,13 @@ type Registry struct {
 	// latency-free: no persistence, no cross-node acknowledgement, no offline fallback.
 	offline         OfflineChannel
 	outbox          Outbox
+	outboxEnvelope  bool
 	confirmDelivery bool
 	confirmTimeout  time.Duration
 
 	// ownerLeaseCoordinator is the raw value passed to WithOwnerLease, before NewRegistry has
-	// checked it implements CASCoordinator. lease is non-nil only once that check has passed;
+	// checked it implements LinearizableFencingCoordinator. lease is non-nil only once that
+	// check has passed;
 	// leaseUnsupported is set instead when it failed, so the first Register call can report
 	// ErrOwnerLeaseUnsupported rather than NewRegistry (which has no error return) silently
 	// leaving fencing off. A nil lease is also the normal, opt-out configuration: every fencing
@@ -231,6 +233,12 @@ type Registry struct {
 	// bgWG tracks every background renewal goroutine (presence, owner lease) so Close can wait
 	// for all of them to exit, however many are running.
 	bgWG sync.WaitGroup
+
+	offlineMu     sync.Mutex
+	offlineCtx    context.Context
+	offlineCancel context.CancelFunc
+	offlineWG     sync.WaitGroup
+	offlineClosed bool
 }
 
 // RegistryOption configures a Registry created with NewRegistry.
@@ -287,9 +295,9 @@ func WithConfirmationTimeout(d time.Duration) RegistryOption {
 // and both succeed, producing two live owners for one id. A CAS primitive is what closes that
 // window; the actor directory alone cannot.
 //
-// c must implement CASCoordinator (MemoryCoordinator and coordinator/redis.Coordinator both
-// do). A c that does not makes every subsequent Register fail with ErrOwnerLeaseUnsupported,
-// since NewRegistry itself has no error return to report the mismatch immediately.
+// c must implement LinearizableFencingCoordinator. A c that does not makes every subsequent
+// Register fail with ErrOwnerLeaseUnsupported, since NewRegistry itself has no error return to
+// report the mismatch immediately.
 //
 // Without WithOwnerLease a Registry keeps its current single-instance semantics at zero cost:
 // no lease acquisition, no generation fencing, no extra coordinator round trips. This mirrors
@@ -334,8 +342,8 @@ func NewRegistry(system actor.ActorSystem, logger log.Logger, opts ...RegistryOp
 		r.confirmTimeout = defaultConfirmationTimeout
 	}
 	if r.ownerLeaseCoordinator != nil {
-		if cas, ok := r.ownerLeaseCoordinator.(CASCoordinator); ok {
-			r.lease = newOwnerLease(cas, r.nodeID, ownerLeaseTTL)
+		if fencing, ok := r.ownerLeaseCoordinator.(LinearizableFencingCoordinator); ok {
+			r.lease = newOwnerLease(fencing, r.nodeID, ownerLeaseTTL)
 		} else {
 			r.leaseUnsupported = true
 		}
@@ -358,6 +366,9 @@ func NewRegistry(system actor.ActorSystem, logger log.Logger, opts ...RegistryOp
 			}()
 		}
 	}
+	if r.offline != nil {
+		r.offlineCtx, r.offlineCancel = context.WithCancel(context.Background())
+	}
 	return r
 }
 
@@ -375,6 +386,13 @@ func (r *Registry) Close(_ context.Context) error {
 			r.cancel()
 			r.bgWG.Wait()
 		}
+		r.offlineMu.Lock()
+		r.offlineClosed = true
+		if r.offlineCancel != nil {
+			r.offlineCancel()
+		}
+		r.offlineMu.Unlock()
+		r.offlineWG.Wait()
 
 		r.bridgeMu.Lock()
 		r.bridgesClosed = true
@@ -624,8 +642,8 @@ func (h *ConnHandle) UnregisterHandle(ctx context.Context) error {
 // It returns ErrConnectionExists if id is already registered and WithReplaceExisting was
 // not given, and ErrRegistryClosed if the Registry has been closed. With WithOwnerLease
 // configured it can also return ErrOwnerLeaseUnsupported (the configured Coordinator does
-// not implement CASCoordinator) or ErrOwnerHeld (another node holds id's lease, unexpired,
-// and WithReplaceExisting was not given).
+// not implement LinearizableFencingCoordinator) or ErrOwnerHeld (another node holds id's
+// lease, unexpired, and WithReplaceExisting was not given).
 func (r *Registry) Register(ctx context.Context, id string, send func([]byte) error, opts ...RegisterOption) error {
 	_, err := r.register(ctx, id, send, opts...)
 	return err
@@ -764,7 +782,8 @@ func (r *Registry) register(ctx context.Context, id string, send func([]byte) er
 	if generation != 0 && r.outbox != nil {
 		if advancer, ok := r.outbox.(OutboxGenerationAdvancer); ok {
 			if err := advancer.AdvanceGeneration(ctx, id, generation); err != nil {
-				r.logger.Warnf("gateway: failed to advance outbox ack generation floor for connection %q: %v", id, err)
+				r.rollback(ctx, entry, err)
+				return nil, err
 			}
 		}
 	}
@@ -955,7 +974,7 @@ func (r *Registry) evictEntry(ctx context.Context, entry *connEntry) error {
 // instead of racing this setup.
 func (r *Registry) finalizeRegistration(ctx context.Context, entry *connEntry, topics []string) error {
 	if entry.group != "" {
-		if err := r.ensureBridge(groupTopic(entry.group), r.groupDelivery(entry.group)); err != nil {
+		if err := r.ensureBridge(ctx, groupTopic(entry.group), r.groupDelivery(entry.group)); err != nil {
 			return err
 		}
 	}
@@ -1144,7 +1163,7 @@ func (r *Registry) teardownEntry(ctx context.Context, entry *connEntry, topicsTo
 // A bridge that cannot be established fails the Join and leaves the connection out of the
 // topic: a connection joined to a topic it can never receive broadcasts on is a silent
 // data-loss bug, not a degraded mode.
-func (r *Registry) Join(_ context.Context, id, topic string) error {
+func (r *Registry) Join(ctx context.Context, id, topic string) error {
 	r.mu.Lock()
 	entry, exists := r.conns[id]
 	if !exists {
@@ -1163,7 +1182,7 @@ func (r *Registry) Join(_ context.Context, id, topic string) error {
 	// which is after the reference was taken. Taking the reference first therefore makes it
 	// impossible for a detach to release a reference this Join has not yet acquired and then
 	// have this Join re-create the bridge - the orphaned, member-less bridge leak.
-	if err := r.ensureBridge(topic, r.topicDelivery(topic)); err != nil {
+	if err := r.ensureBridge(ctx, topic, r.topicDelivery(topic)); err != nil {
 		return err
 	}
 
@@ -1256,7 +1275,7 @@ func (r *Registry) removeGroupMemberLocked(group, id string) {
 // that a publish on any node in the cluster reaches this node's local members, and
 // reference-counts it so the subscription only goes away with its last local member.
 // deliver re-delivers a received payload to those members.
-func (r *Registry) ensureBridge(wireTopic string, deliver func(payload []byte, excludes map[string]struct{})) error {
+func (r *Registry) ensureBridge(ctx context.Context, wireTopic string, deliver func(payload []byte, excludes map[string]struct{})) error {
 	r.bridgeMu.Lock()
 	defer r.bridgeMu.Unlock()
 
@@ -1269,7 +1288,7 @@ func (r *Registry) ensureBridge(wireTopic string, deliver func(payload []byte, e
 		return nil
 	}
 
-	sub, err := subscribeTopic(r.system, wireTopic, func(_ context.Context, message proto.Message) {
+	sub, err := subscribeTopic(ctx, r.system, wireTopic, func(_ context.Context, message proto.Message) {
 		r.deliverFromBridge(deliver, message)
 	})
 	if err != nil {
@@ -1407,7 +1426,12 @@ func (r *Registry) SendToConnection(ctx context.Context, id string, payload []by
 	// record is kept whether the target is local or remote; it is the sending node that owns
 	// the at-least-once bookkeeping. Without an Outbox this branch is skipped entirely.
 	if r.outbox != nil {
-		if _, _, err := r.outbox.Append(ctx, id, payload); err != nil {
+		msgID, seq, err := r.outbox.Append(ctx, id, payload)
+		if err != nil {
+			return err
+		}
+		payload, err = r.outboxWirePayload(msgID, seq, payload)
+		if err != nil {
 			return err
 		}
 	}
@@ -1428,6 +1452,13 @@ func (r *Registry) SendToConnection(ctx context.Context, id string, payload []by
 	}
 
 	return r.deliverRemote(ctx, pid, payload)
+}
+
+func (r *Registry) outboxWirePayload(msgID string, seq uint64, payload []byte) ([]byte, error) {
+	if !r.outboxEnvelope {
+		return payload, nil
+	}
+	return EncodeOutboxTextEnvelope(msgID, seq, payload)
 }
 
 // deliverRemote writes payload to a remote connActor. On the default path it is a
@@ -1565,7 +1596,12 @@ func (r *Registry) confirmRemoteGroup(ctx context.Context, group string, payload
 	var wg sync.WaitGroup
 	sem := make(chan struct{}, maxConcurrentConfirmAsks)
 	for _, id := range remoteIDs {
-		sem <- struct{}{}
+		select {
+		case sem <- struct{}{}:
+		case <-ctx.Done():
+			wg.Wait()
+			return int(confirmed), ctx.Err()
+		}
 		wg.Add(1)
 		go func(id string) {
 			defer wg.Done()
@@ -1855,11 +1891,8 @@ func (r *Registry) sendTo(ctx context.Context, id string, payload []byte) error 
 // Without a configured lease it always reports false: no coordinator round trip, no fencing,
 // the zero-cost default every opt-in feature in this package promises.
 //
-// A Coordinator error is logged and treated as "not stale" rather than surfaced to the caller:
-// this check runs inline on every cross-node delivery once WithOwnerLease is configured, and a
-// transient Coordinator hiccup must not silently start dropping an otherwise legitimate
-// owner's traffic - the same fail-open reasoning the rest of this package already applies to a
-// Presence backend error on the delivery path.
+// A Coordinator error is logged and treated as stale. Ownership is unknown, so strict fencing
+// must fail closed rather than write a socket from an owner the coordinator cannot confirm.
 func (r *Registry) staleOwner(ctx context.Context, id string, generation uint64) bool {
 	if r.lease == nil {
 		return false
@@ -1867,7 +1900,7 @@ func (r *Registry) staleOwner(ctx context.Context, id string, generation uint64)
 	nodeID, currentGeneration, ok, err := r.lease.ownerNode(ctx, id)
 	if err != nil {
 		r.logger.Warnf("gateway: failed to check owner lease for connection %q: %v", id, err)
-		return false
+		return true
 	}
 	return !ok || nodeID != r.nodeID || currentGeneration != generation
 }

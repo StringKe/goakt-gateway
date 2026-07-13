@@ -63,15 +63,16 @@ type topicSubscription struct {
 // Terminated on the topic actor's side), so dedup, retention, and cross-node
 // dissemination semantics owned by the topic actor are untouched; this function only
 // supplies the plain-callback bridging on top.
-func subscribeTopic(system actor.ActorSystem, topic string, handler func(ctx context.Context, message proto.Message)) (*topicSubscription, error) {
+func subscribeTopic(ctx context.Context, system actor.ActorSystem, topic string, handler func(ctx context.Context, message proto.Message)) (*topicSubscription, error) {
 	topicActorPID := system.TopicActor()
 	if topicActorPID == nil {
 		return nil, ErrPubSubUnavailable
 	}
 
 	name := fmt.Sprintf("%s-%s", bridgeActorNamePrefix, uuid.NewString())
-	pid, err := system.Spawn(context.Background(), name,
-		newBridgeActor(topic, topicActorPID, handler),
+	ready := make(chan struct{})
+	pid, err := system.Spawn(ctx, name,
+		newBridgeActor(topic, topicActorPID, handler, ready),
 		actor.WithLongLived(),
 		actor.WithRelocationDisabled(),
 		actor.WithSupervisor(
@@ -85,7 +86,14 @@ func subscribeTopic(system actor.ActorSystem, topic string, handler func(ctx con
 		return nil, err
 	}
 
-	return &topicSubscription{topic: topic, pid: pid, topicActorPID: topicActorPID, system: system}, nil
+	subscription := &topicSubscription{topic: topic, pid: pid, topicActorPID: topicActorPID, system: system}
+	select {
+	case <-ready:
+		return subscription, nil
+	case <-ctx.Done():
+		_ = subscription.Close()
+		return nil, ctx.Err()
+	}
 }
 
 // Close unsubscribes from the topic and stops the bridge actor. Safe to call more than
@@ -103,12 +111,14 @@ func (s *topicSubscription) Close() error {
 
 // bridgeActor forwards messages published to a topic to a plain callback, so that
 // Registry does not need to define and spawn its own Actor type for cluster-wide
-// broadcast fan-out. It subscribes on PostStart and ignores the topic actor's Subscribe/
-// Unsubscribe acknowledgements and death-watch Terminated notices.
+// broadcast fan-out. It subscribes on PostStart and signals readiness only after the topic
+// actor confirms that subscription.
 type bridgeActor struct {
 	topic         string
 	topicActorPID *actor.PID
 	handler       func(ctx context.Context, message proto.Message)
+	ready         chan struct{}
+	readyOnce     sync.Once
 	logger        log.Logger
 }
 
@@ -116,8 +126,8 @@ type bridgeActor struct {
 var _ actor.Actor = (*bridgeActor)(nil)
 
 // newBridgeActor creates the actor backing a topicSubscription.
-func newBridgeActor(topic string, topicActorPID *actor.PID, handler func(ctx context.Context, message proto.Message)) *bridgeActor {
-	return &bridgeActor{topic: topic, topicActorPID: topicActorPID, handler: handler}
+func newBridgeActor(topic string, topicActorPID *actor.PID, handler func(ctx context.Context, message proto.Message), ready chan struct{}) *bridgeActor {
+	return &bridgeActor{topic: topic, topicActorPID: topicActorPID, handler: handler, ready: ready}
 }
 
 // PreStart is called before the actor starts.
@@ -128,11 +138,15 @@ func (a *bridgeActor) PreStart(*actor.Context) error {
 // Receive subscribes to the topic on PostStart and forwards every other delivered
 // message to handler.
 func (a *bridgeActor) Receive(ctx *actor.ReceiveContext) {
-	switch ctx.Message().(type) {
+	switch message := ctx.Message().(type) {
 	case *actor.PostStart:
 		a.logger = ctx.Logger()
 		ctx.Tell(a.topicActorPID, actor.NewSubscribe(a.topic))
-	case *actor.SubscribeAck, *actor.UnsubscribeAck, *actor.Terminated:
+	case *actor.SubscribeAck:
+		if message.Topic() == a.topic {
+			a.readyOnce.Do(func() { close(a.ready) })
+		}
+	case *actor.UnsubscribeAck, *actor.Terminated:
 		// subscription lifecycle signals; nothing to forward to the handler.
 	default:
 		a.dispatch(ctx)

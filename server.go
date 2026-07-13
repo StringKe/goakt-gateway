@@ -24,6 +24,7 @@ package gateway
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	stdlog "log"
 	"net/http"
@@ -150,7 +151,7 @@ func (s *Server) Shutdown(ctx context.Context) error {
 		d.Drain()
 	}
 	if s.manager != nil {
-		_ = s.manager.Stop(ctx)
+		return errors.Join(s.manager.Stop(ctx), s.httpServer.Shutdown(ctx))
 	}
 	return s.httpServer.Shutdown(ctx)
 }

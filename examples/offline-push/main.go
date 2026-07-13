@@ -47,7 +47,7 @@ package main
 
 import (
 	"context"
-	"crypto/elliptic"
+	"crypto/ecdh"
 	"crypto/rand"
 	"encoding/base64"
 	"encoding/json"
@@ -383,12 +383,11 @@ func newFakePushService() *httptest.Server {
 // so subscribeHandler calls this in its place; a real application never generates
 // these itself; it only ever receives and stores what the browser sent it.
 func generateDemoSubscriptionKeys() (p256dh, auth string, err error) {
-	curve := elliptic.P256()
-	_, x, y, err := elliptic.GenerateKey(curve, rand.Reader)
+	privateKey, err := ecdh.P256().GenerateKey(rand.Reader)
 	if err != nil {
 		return "", "", fmt.Errorf("generate subscriber key pair: %w", err)
 	}
-	pub := elliptic.Marshal(curve, x, y)
+	pub := privateKey.PublicKey().Bytes()
 
 	authSecret := make([]byte, 16)
 	if _, err := rand.Read(authSecret); err != nil {

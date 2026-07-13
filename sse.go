@@ -118,7 +118,9 @@ func WithSSEEventName(f func(payload []byte) string) SSEHandlerOption {
 // SSEGapEventName event, so the loss is visible rather than silent.
 //
 // Without a history, event ids are still emitted but restart at 1 on every connection and no
-// replay is possible.
+// replay is possible. A backend implementing SharedSSEHistory is accepted only with a Registry
+// configured by WithOwnerLease and a backend implementing GenerationalHistory. This prevents a
+// stale replica from writing into a new owner's shared replay stream after takeover.
 func WithSSEHistory(h SSEHistory) SSEHandlerOption {
 	return func(handler *SSEHandler) { handler.history = h }
 }
@@ -210,6 +212,7 @@ type SSEHandler struct {
 	topicsFunc     func(*http.Request) []string
 	eventName      func(payload []byte) string
 	history        SSEHistory
+	configErr      error
 	retry          time.Duration
 	backpressure   BackpressurePolicy
 	onConnect      func(ctx context.Context, info *ConnInfo, r *http.Request)
@@ -330,6 +333,13 @@ func NewSSEHandler(registry *Registry, opts ...SSEHandlerOption) *SSEHandler {
 	for _, opt := range opts {
 		opt(h)
 	}
+	if shared, ok := h.history.(SharedSSEHistory); ok && shared != nil {
+		if h.registry == nil || h.registry.lease == nil {
+			h.configErr = ErrSSESharedHistoryRequiresOwnerLease
+		} else if _, ok := h.history.(GenerationalHistory); !ok {
+			h.configErr = ErrSSESharedHistoryRequiresGenerationalHistory
+		}
+	}
 	// Clamp after options so a make(chan []byte, size) below cannot panic on a negative buffer
 	// and a non-positive write timeout cannot disable the deadline that bounds a stalled write.
 	if h.bufferSize <= 0 {
@@ -360,6 +370,10 @@ func (h *SSEHandler) Drain() {
 
 // ServeHTTP implements http.Handler.
 func (h *SSEHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if h.configErr != nil {
+		http.Error(w, h.configErr.Error(), http.StatusInternalServerError)
+		return
+	}
 	select {
 	case <-h.shutdown:
 		http.Error(w, "shutting down", http.StatusServiceUnavailable)
@@ -597,7 +611,20 @@ func (h *SSEHandler) open(ctx context.Context, info *ConnInfo, session *sseSessi
 	if session.generation != 0 && h.history != nil {
 		if generational, ok := h.history.(GenerationalHistory); ok {
 			if err := generational.AdvanceGeneration(ctx, info.ID, session.generation); err != nil {
-				h.logger.Warnf("gateway: failed to advance SSE history generation for connection %q: %v", info.ID, err)
+				// The generation floor is the fence that makes the registration safe to expose.
+				// Removing this exact entry also releases its actor and lease before open returns.
+				if unregisterErr := handle.UnregisterHandle(context.WithoutCancel(ctx)); unregisterErr != nil {
+					h.logger.Warnf("gateway: failed to roll back SSE connection %q after history generation advance failed: %v", info.ID, unregisterErr)
+				}
+				h.mu.Lock()
+				if h.sessions[info.ID] == session {
+					delete(h.sessions, info.ID)
+				}
+				h.mu.Unlock()
+				// open failed before ServeHTTP installed its deferred close, so this is the one
+				// matching Done for the Add performed when the session was admitted above.
+				h.teardownWG.Done()
+				return err
 			}
 		}
 	}

@@ -37,8 +37,9 @@
 //
 // # Data model
 //
-// One Redis LIST per connection id holds that connection's most recent events, oldest at
-// the head. Each element is the JSON encoding of {id, payload}; the payload is a Go []byte,
+// Two Redis keys in one Cluster hash slot hold each connection's history: a LIST of recent
+// events and a HASH containing the highest accepted generation and sequence. Each list element
+// is the JSON encoding of {id, payload}; the payload is a Go []byte,
 // which encoding/json emits as base64, so an event body of arbitrary bytes (including
 // newlines and NULs) round-trips without any delimiter framing that a raw payload could
 // collide with.
@@ -58,33 +59,11 @@
 // # Generation fencing
 //
 // History also implements gateway.GenerationalHistory. AppendGenerational and
-// AdvanceGeneration need a per-connection "highest generation observed" fact available to the
-// very next write, atomically with that write, but adding a second Redis key to hold it would
-// break the single-key-per-connection design this package advertises (a Redis Cluster would
-// then need a hash tag to keep the two keys co-located, and there would be two round trips to
-// keep consistent instead of one). Instead the fact rides along inside the connection's
-// existing LIST: every element AppendGenerational or AdvanceGeneration writes is stamped with
-// the generation and sequence it was accepted at, and appendGenerationalScript/
-// advanceGenerationScript both derive "highest observed" by LINDEX-ing the list's own tail
-// (the newest, and therefore highest-generation, element - the scripts never accept a write
-// that would make the list stop being non-decreasing in generation) rather than consulting any
-// separate piece of state.
-//
-// AdvanceGeneration has no event of its own to attach the generation to, so it stores it in a
-// reserved marker element carrying generationMarkerEventID - the same reserved-control-byte
-// convention the root gateway package uses for evictReasonPrefix and groupTopicPrefix, chosen
-// so it can never collide with a real id (every real id this package is handed comes from
-// gateway's formatSSEEventID, which never emits a leading NUL). It is stamped with the tail's
-// sequence unchanged, not the next one, since it carries no real event and must not create a
-// gap in the counter AppendGenerational hands out. Since filters markers out of everything it
-// returns, so they are invisible to every caller of the plain SSEHistory contract and only ever
-// observed, indirectly, by a later AppendGenerational/AdvanceGeneration call reading the tail.
-//
-// Plain (non-generational) Append never reads or writes generation/sequence at all; an element
-// it stores simply has no "g"/"s" fields, and a generational call that later encounters one as
-// the tail treats the missing fields as generation 0, sequence 0 - the correct behavior for a
-// connection that has never had a lease, and consistent with generation 0 being what a caller
-// without a configured owner lease always passes.
+// AdvanceGeneration atomically read and update the state HASH in the same EVAL as the event
+// LIST. The two keys share a base64-encoded connection-id hash tag, so Redis Cluster executes
+// every operation in one slot. Plain Append never changes generation or sequence, but refreshes
+// the existing state key TTL so plain and generational callers cannot accidentally reset the
+// fencing floor while retaining the event history.
 //
 // # Reclamation
 //
@@ -123,57 +102,37 @@ const DefaultKeyPrefix = "gateway:ssehistory:"
 // browser's reconnect window without unbounded growth.
 const DefaultPerConn = 64
 
-// DefaultTTL is the idle reclaim window applied to each connection key when WithTTL is not
+// DefaultTTL is the idle reclaim window applied to each connection's keys when WithTTL is not
 // supplied. A connection whose node dies is reclaimed by Redis one hour after its last write,
 // which is far longer than any realistic EventSource reconnect gap yet still bounds leakage.
 const DefaultTTL = time.Hour
 
-// generationMarkerEventID is the reserved event id AdvanceGeneration stamps its markers with.
-// It leads with a NUL byte, the same reserved-control-byte trick evictReasonPrefix and
-// groupTopicPrefix use in the root gateway package: every real id this package is ever handed
-// comes from gateway's formatSSEEventID (connID + "-" + a decimal sequence), which can never
-// produce one starting with a NUL, so a marker can never be mistaken for - or collide with - a
-// real replayable event. Since strips every element carrying this id out of what it returns.
-const generationMarkerEventID = "\x00goaktGatewaySSEGenerationMarker\x00"
-
 // appendScript records one event at the tail of the connection's list, trims the list back to
 // the most recent perConn elements, and re-arms the key's idle TTL, all atomically.
 //
-// KEYS[1] connection key. ARGV[1] JSON-encoded event, ARGV[2] perConn, ARGV[3] TTL in
+// KEYS[1] event key, KEYS[2] generation state key. ARGV[1] JSON-encoded event, ARGV[2] perConn, ARGV[3] TTL in
 // milliseconds.
 var appendScript = goredis.NewScript(`
 redis.call("RPUSH", KEYS[1], ARGV[1])
 redis.call("LTRIM", KEYS[1], -tonumber(ARGV[2]), -1)
 redis.call("PEXPIRE", KEYS[1], ARGV[3])
+if redis.call("EXISTS", KEYS[2]) == 1 then
+	redis.call("PEXPIRE", KEYS[2], ARGV[3])
+end
 return 1
 `)
 
-// lastGenerationAndSeq is shared Lua, inlined into both scripts below rather than factored into
-// a callable, since Redis EVAL scripts do not share state or functions across separate EVAL
-// invocations - each script is its own self-contained source. It reads the connection list's
-// tail element (the newest, and by construction the highest-generation, one - see the package
-// doc's "Generation fencing" section) and decodes the generation/sequence it was stamped with,
-// defaulting to 0/0 for a connection with no prior generational write (an empty list, or a tail
-// written by the plain, non-generational Append).
+// lastGenerationAndSeq reads the durable generation state shared by plain and generational
+// writes. It is inlined because Redis EVAL executions do not share Lua functions.
 const lastGenerationAndSeq = `
-local lastGeneration = 0
-local lastSeq = 0
-local tail = redis.call("LINDEX", KEYS[1], -1)
-if tail then
-	local ok, decoded = pcall(cjson.decode, tail)
-	if ok and type(decoded) == "table" and decoded.g and decoded.s then
-		lastGeneration = decoded.g
-		lastSeq = decoded.s
-	end
-end
+local lastGeneration = tonumber(redis.call("HGET", KEYS[2], "generation")) or 0
+local lastSeq = tonumber(redis.call("HGET", KEYS[2], "sequence")) or 0
 `
 
 // appendGenerationalScript is AppendGenerational's atomic accept/reject-and-assign-sequence
-// counterpart to appendScript. See the package doc's "Generation fencing" section for how it
-// derives the connection's last known generation/sequence from the list's own tail instead of a
-// second key.
+// counterpart to appendScript. Generation state and event append are one atomic operation.
 //
-// KEYS[1] connection key. ARGV[1] event id, ARGV[2] base64-encoded payload, ARGV[3] caller's
+// KEYS[1] event key, KEYS[2] state key. ARGV[1] event id, ARGV[2] base64-encoded payload, ARGV[3] caller's
 // generation, ARGV[4] perConn, ARGV[5] TTL in milliseconds.
 //
 // Returns a two-element array: {1, newSeq} once accepted, or {0, lastSeq} when generation is
@@ -188,33 +147,35 @@ local newSeq = lastSeq + 1
 local event = cjson.encode({id = ARGV[1], p = ARGV[2], g = generation, s = newSeq})
 redis.call("RPUSH", KEYS[1], event)
 redis.call("LTRIM", KEYS[1], -tonumber(ARGV[4]), -1)
+redis.call("HSET", KEYS[2], "generation", generation, "sequence", newSeq)
 redis.call("PEXPIRE", KEYS[1], ARGV[5])
+redis.call("PEXPIRE", KEYS[2], ARGV[5])
 return {1, newSeq}
 `)
 
-// advanceGenerationScript is AdvanceGeneration's atomic implementation: a no-op when the
-// caller's generation does not exceed what the list's tail already carries, otherwise a marker
-// element recording the new generation. The marker is stamped with lastSeq, not lastSeq + 1: it
-// carries no real event, so it must not consume a sequence number, and the next
-// AppendGenerational call (which computes its own sequence as the tail's s plus one) then
-// resumes at exactly the value it would have had with no takeover in between - the counter
-// GenerationalHistory documents as gapless across accepted AppendGenerational calls stays
-// gapless with an AdvanceGeneration between two of them.
+// advanceGenerationScript is AdvanceGeneration's atomic implementation. It stores only state,
+// never a marker event, so a takeover cannot consume one of the perConn replay slots.
 //
-// KEYS[1] connection key. ARGV[1] generationMarkerEventID, ARGV[2] caller's generation,
-// ARGV[3] perConn, ARGV[4] TTL in milliseconds.
+// KEYS[1] event key, KEYS[2] state key. ARGV[1] caller's generation, ARGV[2] TTL in milliseconds.
 //
 // Returns 1 when a marker was written, 0 for the no-op case.
 var advanceGenerationScript = goredis.NewScript(lastGenerationAndSeq + `
-local generation = tonumber(ARGV[2])
+local generation = tonumber(ARGV[1])
 if generation <= lastGeneration then
 	return 0
 end
 
-local marker = cjson.encode({id = ARGV[1], p = "", g = generation, s = lastSeq})
-redis.call("RPUSH", KEYS[1], marker)
-redis.call("LTRIM", KEYS[1], -tonumber(ARGV[3]), -1)
-redis.call("PEXPIRE", KEYS[1], ARGV[4])
+redis.call("HSET", KEYS[2], "generation", generation, "sequence", lastSeq)
+redis.call("PEXPIRE", KEYS[2], ARGV[2])
+if redis.call("EXISTS", KEYS[1]) == 1 then
+	redis.call("PEXPIRE", KEYS[1], ARGV[2])
+end
+return 1
+`)
+
+var refreshTTLScript = goredis.NewScript(`
+redis.call("PEXPIRE", KEYS[1], ARGV[1])
+redis.call("PEXPIRE", KEYS[2], ARGV[1])
 return 1
 `)
 
@@ -259,8 +220,8 @@ func WithTTL(d time.Duration) Option {
 
 // New creates a History backed by client. client may be a *redis.Client, a
 // *redis.ClusterClient, *redis.Ring, or any other goredis.UniversalClient implementation,
-// pointed at either a Redis or a Valkey server; every operation touches exactly one key, so
-// the cluster case needs no hash tags.
+// pointed at either a Redis or a Valkey server. Every operation uses an event LIST and state
+// HASH that share one hash tag, so the cluster case stays single-slot and atomic.
 func New(client goredis.UniversalClient, opts ...Option) *History {
 	h := &History{
 		client:  client,
@@ -287,8 +248,9 @@ type storedEvent struct {
 	Payload []byte `json:"p"`
 }
 
-func (h *History) key(connID string) string {
-	return h.prefix + connID
+func (h *History) keys(connID string) (eventKey, stateKey string) {
+	tag := base64.RawURLEncoding.EncodeToString([]byte(connID))
+	return h.prefix + "events:{" + tag + "}", h.prefix + "state:{" + tag + "}"
 }
 
 // Append implements gateway.SSEHistory. It appends the event to the connection's list,
@@ -299,8 +261,9 @@ func (h *History) Append(ctx context.Context, connID, eventID string, payload []
 	if err != nil {
 		return err
 	}
+	eventKey, stateKey := h.keys(connID)
 	return appendScript.Run(ctx, h.client,
-		[]string{h.key(connID)},
+		[]string{eventKey, stateKey},
 		encoded,
 		strconv.Itoa(h.perConn),
 		strconv.FormatInt(h.ttl.Milliseconds(), 10),
@@ -314,8 +277,9 @@ func (h *History) Append(ctx context.Context, connID, eventID string, payload []
 // what lets Since's plain encoding/json.Unmarshal decode an AppendGenerational-written element
 // exactly like one Append wrote.
 func (h *History) AppendGenerational(ctx context.Context, connID, eventID string, payload []byte, generation uint64) (uint64, error) {
+	eventKey, stateKey := h.keys(connID)
 	result, err := appendGenerationalScript.Run(ctx, h.client,
-		[]string{h.key(connID)},
+		[]string{eventKey, stateKey},
 		eventID,
 		base64.StdEncoding.EncodeToString(payload),
 		strconv.FormatUint(generation, 10),
@@ -338,11 +302,10 @@ func (h *History) AppendGenerational(ctx context.Context, connID, eventID string
 
 // AdvanceGeneration implements gateway.GenerationalHistory. See advanceGenerationScript.
 func (h *History) AdvanceGeneration(ctx context.Context, connID string, generation uint64) error {
+	eventKey, stateKey := h.keys(connID)
 	return advanceGenerationScript.Run(ctx, h.client,
-		[]string{h.key(connID)},
-		generationMarkerEventID,
+		[]string{eventKey, stateKey},
 		strconv.FormatUint(generation, 10),
-		strconv.Itoa(h.perConn),
 		strconv.FormatInt(h.ttl.Milliseconds(), 10),
 	).Err()
 }
@@ -371,10 +334,10 @@ func decodeGenerationalResult(result any) (accepted int64, seq uint64, err error
 // everything with no error; a known lastEventID returns the events strictly after it; an
 // unknown lastEventID returns everything still retained together with gateway.ErrHistoryGap,
 // so the caller can replay what survives and tell the client that earlier events are gone.
-// Elements written by AdvanceGeneration carry no real event and are filtered out before the
-// Last-Event-ID logic ever sees them, so they are invisible to every caller of this method.
+// AdvanceGeneration records only the state HASH, so replay always reads exactly real events.
 func (h *History) Since(ctx context.Context, connID, lastEventID string) ([]gateway.SSEEvent, error) {
-	raw, err := h.client.LRange(ctx, h.key(connID), 0, -1).Result()
+	eventKey, _ := h.keys(connID)
+	raw, err := h.client.LRange(ctx, eventKey, 0, -1).Result()
 	if err != nil {
 		return nil, err
 	}
@@ -384,9 +347,6 @@ func (h *History) Since(ctx context.Context, connID, lastEventID string) ([]gate
 		var stored storedEvent
 		if err := json.Unmarshal([]byte(item), &stored); err != nil {
 			return nil, err
-		}
-		if stored.ID == generationMarkerEventID {
-			continue
 		}
 		events = append(events, gateway.SSEEvent{ID: stored.ID, Payload: stored.Payload})
 	}
@@ -402,7 +362,7 @@ func (h *History) Since(ctx context.Context, connID, lastEventID string) ([]gate
 	return emptyToNil(events), gateway.ErrHistoryGap
 }
 
-// RefreshTTL re-arms the connection key's idle TTL without appending an event. The gateway
+// RefreshTTL re-arms the connection keys' idle TTL without appending an event. The gateway
 // SSEHandler calls it on every keepalive, so a live but low-traffic stream - one whose
 // application produces no real event for longer than the TTL - keeps its buffer for as long as
 // the connection stays up instead of having Redis reclaim it and then answering the client's
@@ -410,8 +370,14 @@ func (h *History) Since(ctx context.Context, connID, lastEventID string) ([]gate
 // no-op returning 0, so a connection that has not appended anything yet, or was already
 // reclaimed, is left untouched exactly as gateway.MemorySSEHistory leaves an unknown one.
 func (h *History) RefreshTTL(ctx context.Context, connID string) error {
-	return h.client.PExpire(ctx, h.key(connID), h.ttl).Err()
+	eventKey, stateKey := h.keys(connID)
+	return refreshTTLScript.Run(ctx, h.client, []string{eventKey, stateKey}, strconv.FormatInt(h.ttl.Milliseconds(), 10)).Err()
 }
+
+// SharedSSEHistory marks this backend as shared across processes. SSEHandler requires an
+// OwnerLease and GenerationalHistory for such a backend so a stale owner cannot contaminate a
+// new owner's replay stream after takeover.
+func (*History) SharedSSEHistory() {}
 
 // emptyToNil normalizes an empty result to a nil slice, matching gateway.MemorySSEHistory so
 // callers observe the two backends identically.

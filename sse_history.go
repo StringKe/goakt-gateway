@@ -59,6 +59,16 @@ type SSEHistory interface {
 	Since(ctx context.Context, connID, lastEventID string) (events []SSEEvent, err error)
 }
 
+// SharedSSEHistory marks a replay backend whose state is visible to more than one process.
+// SSEHandler rejects this capability unless its Registry has WithOwnerLease configured and the
+// backend also implements GenerationalHistory. Local-only histories must not implement this
+// marker: they are safe only when reconnects remain on the same process.
+type SharedSSEHistory interface {
+	SSEHistory
+
+	SharedSSEHistory()
+}
+
 // ErrStaleGeneration is returned by GenerationalHistory.AppendGenerational when generation is
 // lower than the highest generation already recorded for the connection: a write from a node
 // whose connection owner lease (see WithOwnerLease in the registry) was superseded by a
@@ -74,8 +84,9 @@ var ErrStaleGeneration = errors.New("gateway: sse history append rejected: gener
 // caller that holds a fenced generation type-asserts up to this interface to use it. This
 // mirrors the WithDeliveryConfirmation opt-in precedent elsewhere in this package.
 //
-// MemorySSEHistory and ssehistory/redis.History both implement it. A third-party SSEHistory
-// that does not is simply used unfenced, exactly as it is today.
+// MemorySSEHistory and ssehistory/redis.History both implement it. A shared third-party
+// SSEHistory must also implement SharedSSEHistory or SSEHandler treats it as explicitly
+// local-only. A marked shared backend without this capability is rejected at handler setup.
 type GenerationalHistory interface {
 	SSEHistory
 

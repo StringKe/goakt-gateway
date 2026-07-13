@@ -88,7 +88,10 @@
 //     monotonic across restarts and across nodes appending to the same connection; a
 //     per-process counter could not. Duplicates are still possible, so clients dedupe on the
 //     PersistedMessage ID/Seq. NewMemoryOutbox is process-local; the persistence/redis
-//     subpackage survives restart and works across nodes.
+//     subpackage survives restart and works across nodes. WithOutboxEnvelope makes both
+//     real-time delivery and reconnect replay use the same ASCII base64 frame containing the
+//     message ID, sequence, and original payload. Without WithOutboxEnvelope, delivery uses
+//     the original raw payload.
 //   - Registry.WatchPresence and Registry.GroupMembers expose optional PresenceWatcher and
 //     PresenceDirectory capabilities (both implemented by MemoryPresence and presence/redis);
 //     the redis watch is best-effort Redis Pub/Sub, not a durable event log.
@@ -103,8 +106,13 @@
 // cluster-wide is PA/EC eventually consistent, not an atomic cluster lock: two nodes racing
 // Register for the same connection id can both observe no owner and both succeed (split
 // brain). Sequential takeover - one node evicting an owner it can already see - works without
-// anything below; only a genuine concurrent race needs it. WithOwnerLease(c) (c must
-// implement CASCoordinator) closes that window by acquiring a CAS-arbitrated lease per
+// anything below; only a genuine concurrent race needs it. WithOwnerLease(c) only accepts a
+// LinearizableFencingCoordinator, which explicitly declares linearizable fencing across failover. The
+// MemoryCoordinator provides that capability only for a single process. The Redis or Valkey
+// Coordinator remains valid for certificate coordination, but asynchronous replication cannot
+// provide strict OwnerLease fencing across failover and it deliberately does not implement
+// LinearizableFencingCoordinator. A multi-instance deployment therefore supplies a consensus-backed
+// LinearizableFencingCoordinator. WithOwnerLease closes the window by acquiring a CAS-arbitrated lease per
 // connection id before Register publishes it locally, and fencing every subsequent
 // operation - every local and cross-node delivery path (SendToConnection, SendToGroup,
 // Broadcast, and a remote connActor's own delivery), background lease renewal, Presence

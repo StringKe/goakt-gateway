@@ -189,8 +189,10 @@ func (s *graphqlWSServer) servePublish(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	fmt.Fprintf(w, "broadcast to topic %q: delivered=%d dropped=%d remote=%d\n",
-		topic, result.Delivered, result.Dropped, result.Remote)
+	if _, err := fmt.Fprintf(w, "broadcast to topic %q: delivered=%d dropped=%d remote=%d\n",
+		topic, result.Delivered, result.Dropped, result.Remote); err != nil {
+		log.Printf("write broadcast response: %v", err)
+	}
 }
 
 // mustRawString marshals s as a JSON string. Used to build publishEnvelope.Data from a
@@ -213,7 +215,11 @@ func (s *graphqlWSServer) serveWS(w http.ResponseWriter, r *http.Request) {
 		// Accept already wrote the failure response.
 		return
 	}
-	defer conn.CloseNow()
+	defer func() {
+		if err := conn.CloseNow(); err != nil {
+			log.Printf("close websocket connection: %v", err)
+		}
+	}()
 
 	if conn.Subprotocol() != graphqlWSSubprotocol {
 		// graphql-ws clients refuse to talk to a server that did not negotiate their

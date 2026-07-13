@@ -83,14 +83,17 @@ func (m *MemoryCertStore) Get(_ context.Context, domain string) (*Certificate, e
 	if !ok {
 		return nil, ErrCertificateNotFound
 	}
-	return cert, nil
+	return cloneCertificate(cert), nil
 }
 
 // Put implements CertStore.
 func (m *MemoryCertStore) Put(_ context.Context, cert *Certificate) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	m.certs[cert.Domain] = cert
+	if cert == nil {
+		return fmt.Errorf("gateway: certificate is required")
+	}
+	m.certs[cert.Domain] = cloneCertificate(cert)
 	return nil
 }
 

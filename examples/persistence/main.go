@@ -26,8 +26,9 @@
 // never came".
 //
 //   - Registry.SendToConnection persists every payload to the Outbox before it touches the
-//     socket (see WithOutbox). That happens whether or not the connection is currently
-//     online: sending to an offline user still queues the message, it just returns
+//     socket (see WithOutbox). WithOutboxEnvelope sends its assigned message id and sequence
+//     alongside that payload in a text-safe frame. That happens whether or not the connection
+//     is currently online: sending to an offline user still queues the message, it just returns
 //     ErrConnectionNotFound instead of writing anywhere. This sample's /send handler treats
 //     that as success, not failure.
 //   - A reconnect (Registry.Register) redelivers every message the Outbox still holds for
@@ -35,13 +36,7 @@
 //     demo page's "Connect" button exercises this: send messages, close the tab without
 //     acking, reconnect, watch the same messages arrive again.
 //   - Registry.Ack is how redelivery stops: it removes one message from the Outbox by the id
-//     the Outbox assigned it. SendToConnection does not hand that id back to its caller (it
-//     keeps the "send" primitive a plain payload-in/error-out call, see the package's
-//     interfaceNotes on WithOutbox), so this sample recovers it the way the library expects
-//     applications to: read it back with Outbox.Unacked. The wire message this sample sends
-//     to the client carries its own application-level id (a UUID distinct from the Outbox's
-//     id); on ack, the handler scans Unacked, matches that application id against the
-//     (still small, in-flight) unacknowledged tail, and acks the Outbox entry it finds it in.
+//     decoded by the client from the envelope. The server passes that id directly to Ack.
 //
 // What this deliberately does not demonstrate: exactly-once delivery. At-least-once means a
 // message can be redelivered after the client already processed it but before its ack
@@ -69,17 +64,15 @@ import (
 	redisoutbox "github.com/StringKe/goakt-gateway/persistence/redis"
 )
 
-// wireMessage is the JSON payload this sample writes to the socket and expects the client to
-// echo the ID of back in an ack frame. ID is an application-level identifier, chosen here
-// with a fresh UUID per message; it is unrelated to the id the Outbox assigns the same
-// message internally (see ackHandler for how the two are reconciled).
+// wireMessage is the application payload wrapped by the Outbox envelope. ID remains an
+// application-level identifier for duplicate rendering, distinct from the Outbox ack id.
 type wireMessage struct {
 	ID   string `json:"id"`
 	Text string `json:"text"`
 }
 
 // inboundFrame is what the client sends back over the same WebSocket. The only frame this
-// sample understands is an ack, naming the wireMessage.ID it received and processed.
+// sample understands is an ack, naming the Outbox message id it received and processed.
 type inboundFrame struct {
 	Type string `json:"type"`
 	ID   string `json:"id"`
@@ -98,14 +91,14 @@ func main() {
 	defer func() { _ = system.Stop(ctx) }()
 
 	outbox := buildOutbox(ctx)
-	registry := gateway.NewRegistry(system, golog.DiscardLogger, gateway.WithOutbox(outbox))
+	registry := gateway.NewRegistry(system, golog.DiscardLogger, gateway.WithOutbox(outbox), gateway.WithOutboxEnvelope())
 	defer func() { _ = registry.Close(ctx) }()
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", serveIndex)
 	mux.Handle("/ws", gateway.NewWSHandler(registry,
 		gateway.WithWSAuth(authenticateFromQuery),
-		gateway.WithWSOnMessage(ackHandler(registry, outbox)),
+		gateway.WithWSOnMessage(ackHandler(registry)),
 		gateway.WithWSOnConnect(func(_ context.Context, info *gateway.ConnInfo, _ *http.Request) {
 			log.Printf("connect: conn=%q (any unacked tail was just redelivered)", info.ID)
 		}),
@@ -159,38 +152,18 @@ func authenticateFromQuery(r *http.Request) (*gateway.ConnInfo, error) {
 	return &gateway.ConnInfo{ID: user}, nil
 }
 
-// ackHandler processes inbound WebSocket frames looking for acks. On an ack it has to
-// recover the Outbox's internal message id from the application-level id the client reports,
-// because SendToConnection never handed that internal id back to the sender (see the package
-// doc comment). Unacked's result is the connection's small in-flight tail, so a linear scan
-// matching wireMessage.ID against it is cheap and exactly the pattern the library's
-// interfaceNotes describe.
-func ackHandler(registry *gateway.Registry, outbox gateway.Outbox) func(context.Context, *gateway.ConnInfo, []byte) {
+// ackHandler accepts the Outbox message id decoded by the client from the stable envelope.
+func ackHandler(registry *gateway.Registry) func(context.Context, *gateway.ConnInfo, []byte) {
 	return func(ctx context.Context, info *gateway.ConnInfo, payload []byte) {
 		var frame inboundFrame
 		if err := json.Unmarshal(payload, &frame); err != nil || frame.Type != "ack" || frame.ID == "" {
 			return
 		}
-
-		unacked, err := outbox.Unacked(ctx, info.ID)
-		if err != nil {
-			log.Printf("ack: failed to read unacked tail for conn=%q: %v", info.ID, err)
+		if err := registry.Ack(ctx, info.ID, frame.ID); err != nil {
+			log.Printf("ack: failed to ack message %q for conn=%q: %v", frame.ID, info.ID, err)
 			return
 		}
-
-		for _, msg := range unacked {
-			var wm wireMessage
-			if err := json.Unmarshal(msg.Payload, &wm); err != nil || wm.ID != frame.ID {
-				continue
-			}
-			if err := registry.Ack(ctx, info.ID, msg.ID); err != nil {
-				log.Printf("ack: failed to ack message %q for conn=%q: %v", frame.ID, info.ID, err)
-				return
-			}
-			log.Printf("ack: conn=%q acked message %q (seq=%d)", info.ID, frame.ID, msg.Seq)
-			return
-		}
-		log.Printf("ack: conn=%q acked message %q which is not in the unacked tail (already acked, or never sent)", info.ID, frame.ID)
+		log.Printf("ack: conn=%q acked outbox message %q", info.ID, frame.ID)
 	}
 }
 
@@ -360,6 +333,18 @@ function ackMessage(id) {
   }
 }
 
+function decodeEnvelope(text) {
+  const raw = atob(text);
+  const bytes = Uint8Array.from(raw, (char) => char.charCodeAt(0));
+  if (bytes.length < 11 || bytes[0] !== 1) { throw new Error('unsupported outbox envelope'); }
+  const idLen = (bytes[1] << 8) | bytes[2];
+  const headerLen = 11 + idLen;
+  if (bytes.length < headerLen) { throw new Error('truncated outbox envelope'); }
+  const id = new TextDecoder().decode(bytes.slice(3, 3 + idLen));
+  const payload = new TextDecoder().decode(bytes.slice(headerLen));
+  return {id: id, payload: payload};
+}
+
 document.getElementById('connect').onclick = () => {
   if (ws) { ws.close(); }
   const user = document.getElementById('user').value;
@@ -368,9 +353,10 @@ document.getElementById('connect').onclick = () => {
   ws.onopen = () => { document.getElementById('status').textContent = 'connected as ' + user; logLine('[open] ' + user); };
   ws.onmessage = (evt) => {
     logLine('[message] ' + evt.data);
-    const msg = JSON.parse(evt.data);
-    addMessage(msg.id, msg.text);
-    if (document.getElementById('autoAck').checked) { ackMessage(msg.id); }
+    const envelope = decodeEnvelope(evt.data);
+    const msg = JSON.parse(envelope.payload);
+    addMessage(envelope.id, msg.text);
+    if (document.getElementById('autoAck').checked) { ackMessage(envelope.id); }
   };
   ws.onclose = () => { document.getElementById('status').textContent = 'disconnected'; logLine('[close]'); };
   ws.onerror = () => logLine('[error]');

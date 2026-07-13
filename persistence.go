@@ -24,6 +24,7 @@ package gateway
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -126,23 +127,25 @@ type OutboxGenerationAdvancer interface {
 	Outbox
 
 	// AdvanceGeneration raises connID's Ack fencing floor to generation without acking any
-	// message. It is a no-op, not an error, when generation is not strictly greater than the
-	// floor already recorded for connID - that means a takeover (this one or a still newer
-	// one) already advanced it past this call, so there is nothing to do.
+	// message. It is a no-op, not an error, when connID has no Outbox state or generation is
+	// not strictly greater than the recorded floor.
 	AdvanceGeneration(ctx context.Context, connID string, generation uint64) error
 }
 
 // ReplayTailSeq returns the highest Seq among msgs, the replay tail's high-water mark, or 0 if
 // msgs is empty. A caller that redelivers an Outbox's unacknowledged tail on reconnect and
 // must not let a fresh, real-time send overtake it on the wire uses this as the sequence a
-// subsequent real-time envelope's Seq must exceed. Unacked already returns msgs sorted
-// ascending by Seq, so this is just its last element; it is exposed here so that ordering
-// invariant is not an implicit contract every caller has to independently rediscover.
+// subsequent real-time envelope's Seq must exceed. Although Unacked returns msgs sorted
+// ascending by Seq, this public helper also accepts caller-constructed slices, so it scans
+// every element instead of relying on input order.
 func ReplayTailSeq(msgs []PersistedMessage) uint64 {
-	if len(msgs) == 0 {
-		return 0
+	var tail uint64
+	for _, msg := range msgs {
+		if msg.Seq > tail {
+			tail = msg.Seq
+		}
 	}
-	return msgs[len(msgs)-1].Seq
+	return tail
 }
 
 // Outbox envelope wire format.
@@ -171,13 +174,6 @@ func ReplayTailSeq(msgs []PersistedMessage) uint64 {
 // already-ordered hint for the client - one that only needs to feed messages to its
 // application in order does not need to interpret it itself, only the server behind
 // Unacked/Ack does.
-//
-// EncodeOutboxEnvelope/DecodeOutboxEnvelope are provided as the stable format a future sender
-// wires in; this package does not yet wrap either Registry.SendToConnection's real-time write
-// or Registry.resendUnacked's redelivery in it. Both paths must adopt the same choice
-// together - a socket that sees a raw payload on one write and an envelope on the next has no
-// way to tell them apart - so the switch belongs with whichever call site also teaches the
-// client how to recover a message id to ack, not with either persisted-message path alone.
 const envelopeVersion = 1
 
 // envelopeHeaderLen is the fixed portion of the header: version (1 byte) + message id length
@@ -237,6 +233,26 @@ func DecodeOutboxEnvelope(data []byte) (msgID string, seq uint64, payload []byte
 	return msgID, seq, payload, nil
 }
 
+// EncodeOutboxTextEnvelope wraps the binary envelope in base64 so one opt-in frame works for
+// both WebSocket text messages and UTF-8 Server-Sent Events data fields.
+func EncodeOutboxTextEnvelope(msgID string, seq uint64, payload []byte) ([]byte, error) {
+	frame, err := EncodeOutboxEnvelope(msgID, seq, payload)
+	if err != nil {
+		return nil, err
+	}
+	return []byte(base64.StdEncoding.EncodeToString(frame)), nil
+}
+
+// DecodeOutboxTextEnvelope decodes a frame written by EncodeOutboxTextEnvelope.
+func DecodeOutboxTextEnvelope(data []byte) (msgID string, seq uint64, payload []byte, err error) {
+	frame := make([]byte, base64.StdEncoding.DecodedLen(len(data)))
+	n, err := base64.StdEncoding.Decode(frame, data)
+	if err != nil {
+		return "", 0, nil, err
+	}
+	return DecodeOutboxEnvelope(frame[:n])
+}
+
 // WithOutbox attaches an Outbox, upgrading SendToConnection to at-least-once delivery: each
 // payload is persisted before it is written to the socket, and any still-unacknowledged
 // message is redelivered when the connection registers again. Acknowledge messages with
@@ -244,6 +260,12 @@ func DecodeOutboxEnvelope(data []byte) (msgID string, seq uint64, payload []byte
 // fire-and-forget behaviour and stores nothing.
 func WithOutbox(o Outbox) RegistryOption {
 	return func(r *Registry) { r.outbox = o }
+}
+
+// WithOutboxEnvelope writes every persisted message as an ASCII base64 Outbox envelope.
+// It has an effect only with WithOutbox. The default remains raw payloads for compatibility.
+func WithOutboxEnvelope() RegistryOption {
+	return func(r *Registry) { r.outboxEnvelope = true }
 }
 
 // Ack removes a message from connID's outbox once the client confirms it received it. It is
@@ -292,7 +314,12 @@ func (r *Registry) resendUnacked(ctx context.Context, entry *connEntry) {
 		return
 	}
 	for _, msg := range msgs {
-		if err := entry.send(msg.Payload); err != nil {
+		payload, err := r.outboxWirePayload(msg.ID, msg.Seq, msg.Payload)
+		if err != nil {
+			r.logger.Warnf("gateway: failed to encode unacked message %q for connection %q: %v", msg.ID, entry.id, err)
+			continue
+		}
+		if err := entry.send(payload); err != nil {
 			r.logger.Warnf("gateway: failed to redeliver unacked message %q to connection %q: %v", msg.ID, entry.id, err)
 		}
 	}
@@ -313,11 +340,8 @@ type MemoryOutbox struct {
 	// generations is the per-connection Ack fencing floor (see Outbox.Ack): the highest
 	// generation any accepted Ack or AdvanceGeneration call has carried for a connID. An Ack
 	// for a connID this Outbox has never held a message for stays a true no-op and creates no
-	// entry here, so a stream of acks for connection ids this Outbox never heard of cannot grow
-	// this map without bound; AdvanceGeneration is exempt from that gate because it is only ever
-	// called by Registry itself for a connection id it is actually registering, which is bounded
-	// by the number of real connections, not attacker-controlled input. It is cleared by
-	// DropConn along with everything else.
+	// entry here, so a stream of acks or generation advances for unknown connection ids cannot
+	// grow this map without bound. It is cleared by DropConn along with everything else.
 	generations map[string]uint64
 }
 
@@ -424,6 +448,9 @@ func (o *MemoryOutbox) Ack(_ context.Context, connID, msgID string, generation u
 func (o *MemoryOutbox) AdvanceGeneration(_ context.Context, connID string, generation uint64) error {
 	o.mu.Lock()
 	defer o.mu.Unlock()
+	if _, exists := o.seqs[connID]; !exists {
+		return nil
+	}
 	if floor, ok := o.generations[connID]; !ok || generation > floor {
 		o.generations[connID] = generation
 	}

@@ -103,6 +103,15 @@ var (
 	// of the SSEHistory contract that third-party implementations must honour.
 	ErrHistoryGap = errors.New("gateway: sse history gap, the requested Last-Event-ID is no longer retained")
 
+	// ErrSSESharedHistoryRequiresOwnerLease is returned by SSEHandler before it accepts a
+	// request when a SharedSSEHistory has no owner lease. Without a lease, two replicas can
+	// append to the same replay stream after a takeover.
+	ErrSSESharedHistoryRequiresOwnerLease = errors.New("gateway: shared sse history requires WithOwnerLease")
+
+	// ErrSSESharedHistoryRequiresGenerationalHistory is returned by SSEHandler before it
+	// accepts a request when a shared history cannot fence stale writers after takeover.
+	ErrSSESharedHistoryRequiresGenerationalHistory = errors.New("gateway: shared sse history requires GenerationalHistory")
+
 	// ErrIssuanceLockExpired is returned by Manager when a CertIssuer call outlives the
 	// configured issuance lock TTL (see WithIssuanceLockTTL). The Coordinator lock has no
 	// renewal/heartbeat, so a slow issuer can let the lock expire and a second process
@@ -132,7 +141,7 @@ var (
 	ErrOwnerHeld = errors.New("gateway: connection owner lease is held by another node")
 
 	// ErrOwnerLeaseUnsupported is returned when WithOwnerLease is configured with a
-	// Coordinator that does not implement CASCoordinator: owner lease fencing requires an
-	// atomic compare-and-swap primitive that a plain Coordinator does not provide.
-	ErrOwnerLeaseUnsupported = errors.New("gateway: WithOwnerLease requires a Coordinator implementing CASCoordinator")
+	// Coordinator that does not implement LinearizableFencingCoordinator. Strict owner lease
+	// fencing requires one linearizable order across every participating process.
+	ErrOwnerLeaseUnsupported = errors.New("gateway: WithOwnerLease requires a LinearizableFencingCoordinator")
 )

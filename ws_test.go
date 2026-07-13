@@ -32,6 +32,7 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/coder/websocket"
 	"github.com/stretchr/testify/require"
@@ -122,6 +123,51 @@ func TestWSHandlerBinaryMessageType(t *testing.T) {
 	typ, reply := readWS(t, conn)
 	require.Equal(t, websocket.MessageBinary, typ)
 	require.Equal(t, []byte("blob"), reply)
+}
+
+func TestWSHandlerOutboxEnvelopeReplaysAndAcksBinaryPayload(t *testing.T) {
+	system := newTestSystem(t)
+	outbox := gateway.NewMemoryOutbox()
+	registry := gateway.NewRegistry(system, log.DiscardLogger, gateway.WithOutbox(outbox), gateway.WithOutboxEnvelope())
+	t.Cleanup(func() { _ = registry.Close(context.Background()) })
+
+	handler := gateway.NewWSHandler(registry,
+		gateway.WithWSIDFunc(func(r *http.Request) string { return r.URL.Query().Get("id") }),
+	)
+	server := httptest.NewServer(handler)
+	defer server.Close()
+
+	const id = "outbox-ws"
+	wantPayload := []byte{0x00, 0x0A, 0xFF, 0x3A}
+	first := dialWS(t, server, "/?id="+id, nil)
+	awaitRegistered(t, registry, id, true)
+
+	require.NoError(t, registry.SendToConnection(context.Background(), id, wantPayload))
+	typ, frame := readWS(t, first)
+	require.Equal(t, websocket.MessageText, typ)
+	require.True(t, utf8.Valid(frame))
+	msgID, seq, payload, err := gateway.DecodeOutboxTextEnvelope(frame)
+	require.NoError(t, err)
+	require.Equal(t, wantPayload, payload)
+
+	require.NoError(t, first.Close(websocket.StatusNormalClosure, "reconnect"))
+	awaitRegistered(t, registry, id, false)
+
+	second := dialWS(t, server, "/?id="+id, nil)
+	awaitRegistered(t, registry, id, true)
+	replayType, replayFrame := readWS(t, second)
+	require.Equal(t, websocket.MessageText, replayType)
+	require.True(t, utf8.Valid(replayFrame))
+	replayID, replaySeq, replayPayload, err := gateway.DecodeOutboxTextEnvelope(replayFrame)
+	require.NoError(t, err)
+	require.Equal(t, msgID, replayID)
+	require.Equal(t, seq, replaySeq)
+	require.Equal(t, wantPayload, replayPayload)
+
+	require.NoError(t, registry.Ack(context.Background(), id, msgID))
+	unacked, err := outbox.Unacked(context.Background(), id)
+	require.NoError(t, err)
+	require.Empty(t, unacked)
 }
 
 func TestWSHandlerAuthRejected(t *testing.T) {

@@ -1,0 +1,53 @@
+name: Release API
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  api-compatibility:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          fetch-depth: 0
+      - name: Set up Go
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff
+        with:
+          go-version: "1.26.5"
+      - name: Export v0.1.0 API baseline
+        env:
+          APIDIFF_VERSION: v0.0.0-20260709172345-9ea1abe57597
+        run: |
+          set -euo pipefail
+          baseline_dir="$(mktemp -d)"
+          trap 'git worktree remove --force "$baseline_dir"' EXIT
+          git worktree add --detach "$baseline_dir" v0.1.0
+          (
+            cd "$baseline_dir"
+            go run "golang.org/x/exp/cmd/apidiff@${APIDIFF_VERSION}" -m -w "$RUNNER_TEMP/v0.1.0.api" github.com/StringKe/goakt-gateway
+          )
+          go run "golang.org/x/exp/cmd/apidiff@${APIDIFF_VERSION}" -m -w "$RUNNER_TEMP/current.api" github.com/StringKe/goakt-gateway
+      - name: Verify approved API migration
+        env:
+          APIDIFF_VERSION: v0.0.0-20260709172345-9ea1abe57597
+        run: |
+          set -euo pipefail
+          report="$RUNNER_TEMP/v0.1.0-to-current.incompatible.txt"
+          go run "golang.org/x/exp/cmd/apidiff@${APIDIFF_VERSION}" -m -incompatible "$RUNNER_TEMP/v0.1.0.api" "$RUNNER_TEMP/current.api" | tee "$report"
+          if [[ "$GITHUB_REF_TYPE" == "tag" ]] && [[ "$GITHUB_REF_NAME" == v0.1.* ]] && [[ -s "$report" ]]; then
+            echo "incompatible API changes require a v0.2.0 release" >&2
+            exit 1
+          fi
+          approved=".github/api/v0.1.0-to-v0.2.0.incompatible.txt"
+          if ! cmp -s "$approved" "$report"; then
+            diff -u "$approved" "$report"
+            exit 1
+          fi

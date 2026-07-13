@@ -55,6 +55,41 @@ func TestDefaultRenewIntervalIsValidCron(t *testing.T) {
 	require.NoError(t, err)
 }
 
+func TestManagerNormalizesNonPositiveIssuanceLockTTL(t *testing.T) {
+	manager := NewManager(newRaceTestSystem(t), log.DiscardLogger,
+		WithIssuanceLockTTL(0),
+		WithRenewInterval(""),
+	)
+	require.Equal(t, defaultLockTTL, manager.lockTTL)
+}
+
+func TestManagerStartStopConcurrent(t *testing.T) {
+	manager := NewManager(newRaceTestSystem(t), log.DiscardLogger,
+		WithRenewInterval("0 0 * * * *"),
+	)
+
+	const callers = 100
+	var wg sync.WaitGroup
+	errs := make(chan error, callers)
+	for i := 0; i < callers; i++ {
+		wg.Add(1)
+		go func(start bool) {
+			defer wg.Done()
+			if start {
+				errs <- manager.Start(context.Background())
+				return
+			}
+			errs <- manager.Stop(context.Background())
+		}(i%2 == 0)
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		require.NoError(t, err)
+	}
+	require.NoError(t, manager.Stop(context.Background()))
+}
+
 // generateInternalTestCertificate creates a minimal, self-signed leaf certificate for
 // domain, PEM-encoded along with its private key. Mirrors testcert_test.go's
 // generateTestCertificate, duplicated here because this white-box file cannot import the

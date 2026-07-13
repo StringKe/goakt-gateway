@@ -36,10 +36,15 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"html"
 	"log"
 	"net/http"
+	"os"
+	"os/signal"
+	"syscall"
+	"time"
 
 	"github.com/tochemey/goakt/v4/actor"
 	golog "github.com/tochemey/goakt/v4/log"
@@ -48,7 +53,8 @@ import (
 )
 
 func main() {
-	ctx := context.Background()
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
 
 	system, err := actor.NewActorSystem("gateway-echo", actor.WithLogger(golog.DiscardLogger))
 	if err != nil {
@@ -63,7 +69,7 @@ func main() {
 
 	mux := http.NewServeMux()
 
-	mux.Handle("/ws", gateway.NewWSHandler(registry,
+	wsHandler := gateway.NewWSHandler(registry,
 		// WithWSAuth is the primary identity hook in the current API: it resolves the full
 		// ConnInfo (id, group, topics, meta) from the upgrade request in one pass, instead of
 		// the old id/topics-only callbacks that parsed the same query string three times.
@@ -84,7 +90,11 @@ func main() {
 		gateway.WithWSOnDisconnect(func(info *gateway.ConnInfo) {
 			log.Printf("connection %q left", info.ID)
 		}),
-	))
+	)
+	mux.Handle("/ws", wsHandler)
+	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	})
 
 	mux.HandleFunc("/send", func(w http.ResponseWriter, r *http.Request) {
 		id := r.URL.Query().Get("id")
@@ -99,14 +109,32 @@ func main() {
 			return
 		}
 
-		fmt.Fprintf(w, "delivered %q to connection %q\n", html.EscapeString(msg), html.EscapeString(id))
+		if _, err := fmt.Fprintf(w, "delivered %q to connection %q\n", html.EscapeString(msg), html.EscapeString(id)); err != nil {
+			log.Printf("write delivery response: %v", err)
+		}
 	})
 
-	server, err := gateway.NewServer("127.0.0.1:8080", mux)
+	server, err := gateway.NewServer(":8080", mux, gateway.WithDrainOnShutdown(wsHandler))
 	if err != nil {
 		log.Fatal(err)
 	}
 
-	log.Println("gateway-echo listening on http://127.0.0.1:8080 (ws: /ws?id=alice, send: /send?id=alice&msg=hi)")
-	log.Fatal(server.ListenAndServe(ctx))
+	errCh := make(chan error, 1)
+	go func() { errCh <- server.ListenAndServe(ctx) }()
+
+	select {
+	case err := <-errCh:
+		if !errors.Is(err, http.ErrServerClosed) {
+			log.Fatal(err)
+		}
+	case <-ctx.Done():
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		if err := server.Shutdown(shutdownCtx); err != nil {
+			log.Printf("gateway-echo shutdown failed: %v", err)
+		}
+		if err := <-errCh; !errors.Is(err, http.ErrServerClosed) {
+			log.Printf("gateway-echo stopped: %v", err)
+		}
+	}
 }

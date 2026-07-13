@@ -79,6 +79,65 @@ func TestMemoryOutboxUnackedReturnsIndependentCopies(t *testing.T) {
 	require.Equal(t, []byte("keepme"), second[0].Payload, "a mutated returned payload must not leak into the stored snapshot")
 }
 
+func TestMemoryOutboxAdvanceGenerationDoesNotCreateEmptyState(t *testing.T) {
+	o := gateway.NewMemoryOutbox()
+	ctx := context.Background()
+
+	require.NoError(t, o.AdvanceGeneration(ctx, "unused", 3))
+	msgID, _, err := o.Append(ctx, "unused", []byte("payload"))
+	require.NoError(t, err)
+	require.NoError(t, o.Ack(ctx, "unused", msgID, 0))
+
+	msgs, err := o.Unacked(ctx, "unused")
+	require.NoError(t, err)
+	require.Empty(t, msgs)
+}
+
+func TestOutboxTextEnvelopeRoundTrip(t *testing.T) {
+	frame, err := gateway.EncodeOutboxTextEnvelope("m1", 7, []byte("payload"))
+	require.NoError(t, err)
+
+	id, seq, payload, err := gateway.DecodeOutboxTextEnvelope(frame)
+	require.NoError(t, err)
+	require.Equal(t, "m1", id)
+	require.EqualValues(t, 7, seq)
+	require.Equal(t, []byte("payload"), payload)
+}
+
+func TestRegistryOutboxEnvelopeUsesSameFrameForRealtimeAndReplay(t *testing.T) {
+	system := newTestSystem(t)
+	outbox := gateway.NewMemoryOutbox()
+	registry := gateway.NewRegistry(system, nil, gateway.WithOutbox(outbox), gateway.WithOutboxEnvelope())
+	t.Cleanup(func() { _ = registry.Close(context.Background()) })
+
+	send, sent := recordingSend()
+	require.NoError(t, registry.Register(context.Background(), "conn", send))
+	require.NoError(t, registry.SendToConnection(context.Background(), "conn", []byte("one")))
+
+	frames := sent()
+	require.Len(t, frames, 1)
+	id, seq, payload, err := gateway.DecodeOutboxTextEnvelope(frames[0])
+	require.NoError(t, err)
+	require.NotEmpty(t, id)
+	require.EqualValues(t, 1, seq)
+	require.Equal(t, []byte("one"), payload)
+
+	require.NoError(t, registry.Unregister(context.Background(), "conn"))
+	require.NoError(t, registry.Register(context.Background(), "conn", send))
+	frames = sent()
+	require.Len(t, frames, 2)
+	replayID, replaySeq, replayPayload, err := gateway.DecodeOutboxTextEnvelope(frames[1])
+	require.NoError(t, err)
+	require.Equal(t, id, replayID)
+	require.Equal(t, seq, replaySeq)
+	require.Equal(t, payload, replayPayload)
+
+	require.NoError(t, registry.Ack(context.Background(), "conn", id))
+	msgs, err := outbox.Unacked(context.Background(), "conn")
+	require.NoError(t, err)
+	require.Empty(t, msgs)
+}
+
 // TestMemoryOutboxUnackedConcurrentReadersIsolated runs many readers mutating their own
 // returned payloads at once. With the aliasing bug they would race on the shared backing
 // array; with per-read copies each reader owns its bytes. Run under -race to catch the data
@@ -223,9 +282,8 @@ func TestMemoryOutboxAdvanceGenerationIsNoOpWhenNotHigher(t *testing.T) {
 	require.ErrorIs(t, err, gateway.ErrStaleOwner, "the floor must still be 6, not 3, after the stale advance")
 }
 
-// TestReplayTailSeq proves ReplayTailSeq reads the last (highest) Seq of an ascending-ordered
-// batch, which is the contract a caller enforcing replay-then-realtime ordering across a
-// takeover depends on, and that an empty tail reports 0 rather than panicking.
+// TestReplayTailSeq proves ReplayTailSeq returns the maximum Seq regardless of caller input
+// order, which is the high-water mark a replay-then-realtime handoff needs.
 func TestReplayTailSeq(t *testing.T) {
 	require.EqualValues(t, 0, gateway.ReplayTailSeq(nil))
 	require.EqualValues(t, 0, gateway.ReplayTailSeq([]gateway.PersistedMessage{}))
@@ -236,6 +294,13 @@ func TestReplayTailSeq(t *testing.T) {
 		{ID: "c", Seq: 7},
 	}
 	require.EqualValues(t, 7, gateway.ReplayTailSeq(msgs))
+
+	unsorted := []gateway.PersistedMessage{
+		{ID: "tail", Seq: 2},
+		{ID: "high-water", Seq: 11},
+		{ID: "middle", Seq: 7},
+	}
+	require.EqualValues(t, 11, gateway.ReplayTailSeq(unsorted))
 }
 
 // TestOutboxEnvelopeRoundTrip proves EncodeOutboxEnvelope/DecodeOutboxEnvelope are exact

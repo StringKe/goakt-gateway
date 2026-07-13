@@ -143,16 +143,13 @@ func WithOfflineChannel(ch OfflineChannel, opts ...OfflineOption) RegistryOption
 // offline transport cannot hold up SendToGroup's return, and reports the outcome through
 // the optional OfflineObserver and the logger rather than through SendToGroup's error.
 //
-// The goroutine gets a fresh context.WithTimeout rather than SendToGroup's caller context:
-// the caller context can be cancelled the moment SendToGroup returns, which would abort a
-// fallback that has only just started, while an unbounded Background would let a stalled
-// transport pin a concurrency slot forever.
+// The goroutine derives its timeout from the Registry lifecycle rather than SendToGroup's
+// caller context, so a completed caller cannot cancel a valid fallback while Close can stop
+// every in-flight delivery.
 func (r *Registry) maybeOfflineFallback(group string, result DeliveryResult, payload []byte) {
 	if r.offline == nil || !result.None() {
 		return
 	}
-	// The r.offline field is only ever set by WithOfflineChannel, which always stores a
-	// *boundedOffline, so this assertion holds for every configured offline channel.
 	b := r.offline.(*boundedOffline)
 
 	// Take a semaphore slot without blocking SendToGroup. When the bound is saturated the
@@ -173,10 +170,21 @@ func (r *Registry) maybeOfflineFallback(group string, result DeliveryResult, pay
 	buf := make([]byte, len(payload))
 	copy(buf, payload)
 
+	r.offlineMu.Lock()
+	if r.offlineClosed {
+		r.offlineMu.Unlock()
+		<-b.sem
+		return
+	}
+	ctx := r.offlineCtx
+	r.offlineWG.Add(1)
+	r.offlineMu.Unlock()
+
 	go func() {
+		defer r.offlineWG.Done()
 		defer func() { <-b.sem }()
 
-		ctx, cancel := context.WithTimeout(context.Background(), b.timeout)
+		ctx, cancel := context.WithTimeout(ctx, b.timeout)
 		defer cancel()
 
 		err := b.ch.Deliver(ctx, group, buf)

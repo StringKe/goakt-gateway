@@ -266,12 +266,16 @@ func buildMux(node *gatewayNode) *http.ServeMux {
 
 		if local {
 			node.logger.Printf("delivered %q to %q directly - no cluster hop needed", msg, id)
-			fmt.Fprintf(w, "%s: delivered %q to %q locally (this node holds the connection)\n", node.name, html.EscapeString(msg), html.EscapeString(id))
+			if _, err := fmt.Fprintf(w, "%s: delivered %q to %q locally (this node holds the connection)\n", node.name, html.EscapeString(msg), html.EscapeString(id)); err != nil {
+				node.logger.Printf("write local delivery response: %v", err)
+			}
 			return
 		}
 
 		node.logger.Printf("routed %q for %q into the cluster; whichever node actually holds the socket wrote it to the wire", msg, id)
-		fmt.Fprintf(w, "%s: routed %q to %q through the cluster (a different node holds the connection)\n", node.name, html.EscapeString(msg), html.EscapeString(id))
+		if _, err := fmt.Fprintf(w, "%s: routed %q to %q through the cluster (a different node holds the connection)\n", node.name, html.EscapeString(msg), html.EscapeString(id)); err != nil {
+			node.logger.Printf("write routed delivery response: %v", err)
+		}
 	})
 
 	return mux

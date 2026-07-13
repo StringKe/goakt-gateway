@@ -46,7 +46,7 @@ Two design boundaries drive every type in this package:
 go get github.com/StringKe/goakt-gateway
 ```
 
-Requires Go 1.26 and `github.com/tochemey/goakt/v4` v4.3.1 or later. WebSocket support is
+Requires Go 1.26.5 and `github.com/tochemey/goakt/v4` v4.3.1 or later. WebSocket support is
 built on [`github.com/coder/websocket`](https://github.com/coder/websocket).
 
 ## Quickstart
@@ -375,7 +375,7 @@ the client reconnects to the *same node*. `ssehistory/redis.New(client)` removes
 limit: it records every connection's buffer in a shared Redis or Valkey backend, so a
 client whose EventSource reconnects to *any* node in the deployment is replayed correctly
 instead of being told the history is gone. It is wired the same way -
-`WithSSEHistory(ssehistory/redis.New(client))` - and is one of the four interchangeable
+`WithSSEHistory(ssehistory/redis.New(client))` - and is one of the five interchangeable
 [Redis / Valkey backends](#redis--valkey-backends). And history records what was written
 toward a *registered* connection: it covers the real, often-long window between a socket
 dying and the server noticing, not an arbitrary offline period. For a genuinely offline
@@ -507,12 +507,14 @@ Two implementations ship:
 
 - **`NewMemoryCoordinator`** (the default) is process-local - correct for a single
   process, local development, and tests, but does not coordinate issuance across
-  processes.
+  processes. It provides strict `WithOwnerLease` fencing only inside that one process.
 - **`coordinator/redis.New`** is backed by Redis or Valkey (`SET NX PX` for the lock, a Lua
   compare-and-delete for release - a real mutual exclusion, not a best-effort one) and
   coordinates issuance across every process pointed at the same instance. It is a
   separate package specifically so importing the root module never pulls in
-  `github.com/redis/go-redis/v9` for applications that do not want it:
+  `github.com/redis/go-redis/v9` for applications that do not want it. It remains valid
+  for certificate issuance coordination and certificate distribution, but it cannot
+  provide strict `WithOwnerLease` fencing across asynchronous-replication failover.
 
 ```go
 import (
@@ -530,8 +532,9 @@ manager := gateway.NewManager(actorSystem, logger,
 )
 ```
 
-Bring your own implementation (backed by etcd, Consul, a database - anything that can do
-a real TTL'd mutex) by implementing the three-method interface directly.
+Bring your own `Coordinator` implementation by implementing the three-method interface
+directly. Strict multi-instance `WithOwnerLease` additionally requires a
+consensus-backed `LinearizableFencingCoordinator`; do not use Redis or Valkey for that guarantee.
 
 ### Certificate issuers
 
@@ -594,11 +597,37 @@ up. `WithServerErrorLog` exists because a TLS listener logs every failed handsha
 load balancer readiness probes that connect without completing one otherwise produce a
 steady drip of `http: TLS handshake error ...: EOF` on stderr.
 
+### Host deployment contract
+
+This repository is a Go library, not a deployable gateway service. The host application owns
+its container image, Kubernetes resources, health endpoints, tracing, dashboards, alerts,
+SBOM, signing, release promotion, and rollback. A production host running shared state must
+enforce the following exact contract:
+
+- `replicas: 3`, `terminationGracePeriodSeconds: 30`, and a PodDisruptionBudget with
+  `minAvailable: 2`.
+- A `preStop` path calls `Server.Shutdown` with a 30 second context after constructing the
+  server with every WS and SSE handler in `WithDrainOnShutdown`.
+- Readiness is false until the GoAkt actor system and every configured shared backend answer
+  their own health check. Liveness only proves the host process can serve its health endpoint.
+- HPA uses host-owned CPU, memory, and connection metrics. A rollout must preserve at least
+  two ready replicas while one replica drains.
+
+Run this host-owned rollout verification against the deployment that embeds this library:
+
+```sh
+kubectl --context production scale deployment/gateway --replicas=3
+kubectl --context production rollout status deployment/gateway --timeout=30s
+kubectl --context production rollout restart deployment/gateway
+kubectl --context production rollout status deployment/gateway --timeout=30s
+kubectl --context production rollout undo deployment/gateway
+```
+
 ## Redis / Valkey backends
 
-Four of this library's pluggable abstractions ship a shared backend built on
+Five of this library's pluggable abstractions ship a shared backend built on
 [`github.com/redis/go-redis/v9`](https://github.com/redis/go-redis). The RESP protocol is
-the abstraction: all four constructors share one signature - each takes a
+the abstraction: all five constructors share one signature - each takes a
 `redis.UniversalClient` (which covers standalone, Cluster, Sentinel, and Ring) - and
 go-redis speaks the identical protocol to a **Redis** server and to a **Valkey** server,
 so one client, constructed once, backs any or all of them against either with no branch. Point the client wherever your deployment prefers - Valkey
@@ -612,10 +641,11 @@ Redis-proprietary module or a post-7.2 command Valkey has not adopted.
 | `Presence` (cluster-wide online status) | `NewMemoryPresence()` | `presence/redis.NewPresence(client)` | `github.com/StringKe/goakt-gateway/presence/redis` | `WithKeyPrefix` |
 | `CertStore` (certificate persistence) | `NewMemoryCertStore()` / `NewFileCertStore(dir)` | `store/redis.New(client)` | `github.com/StringKe/goakt-gateway/store/redis` | `WithKeyPrefix` (keys carry a `cert:` infix) |
 | `SSEHistory` (Last-Event-ID replay buffer) | `NewMemorySSEHistory(perConn)` | `ssehistory/redis.New(client)` | `github.com/StringKe/goakt-gateway/ssehistory/redis` | `WithKeyPrefix` (default `gateway:ssehistory:`) |
+| `Outbox` (at-least-once delivery) | `NewMemoryOutbox()` | `persistence/redis.New(client)` | `github.com/StringKe/goakt-gateway/persistence/redis` | `WithKeyPrefix` |
 
-One Redis or Valkey instance can carry all four at once: give each a distinct
+One Redis or Valkey instance can carry all five at once: give each a distinct
 `WithKeyPrefix` and their keys never collide, so a single server (or Cluster) backs a whole
-gateway deployment's coordination, presence, certificate, and replay state.
+gateway deployment's coordination, presence, certificate, replay, and outbox state.
 
 ```go
 import (
@@ -626,6 +656,7 @@ import (
 	redispresence "github.com/StringKe/goakt-gateway/presence/redis"
 	redisstore "github.com/StringKe/goakt-gateway/store/redis"
 	redishistory "github.com/StringKe/goakt-gateway/ssehistory/redis"
+	redisoutbox "github.com/StringKe/goakt-gateway/persistence/redis"
 )
 
 // One client, pointed at either a Redis or a Valkey server.
@@ -635,10 +666,11 @@ coordinator := rediscoordinator.New(client, rediscoordinator.WithKeyPrefix("gw:c
 presence := redispresence.NewPresence(client, redispresence.WithKeyPrefix("gw:presence:"))
 certStore := redisstore.New(client, redisstore.WithKeyPrefix("gw:certs:"))
 history := redishistory.New(client, redishistory.WithKeyPrefix("gw:sse:"))
+outbox := redisoutbox.New(client, redisoutbox.WithKeyPrefix("gw:outbox:"))
 ```
 
-All four backends are validated by conformance suites (`coordinator/conformance`,
-`presence/conformance`, `store/conformance`, `ssehistory/conformance`) that run the same
+All five backends are validated by conformance suites (`coordinator/conformance`,
+`presence/conformance`, `store/conformance`, `ssehistory/conformance`, `persistence/conformance`) that run the same
 assertions against both the in-memory implementation and the RESP one, and the RESP suites
 are run against a real Redis server and a real Valkey server (a two-service
 `docker-compose.yml` locally; see [Development](#development)). Interchangeability is a
@@ -764,7 +796,8 @@ anywhere is gone. `WithOutbox(o)` turns `SendToConnection` into store-then-deliv
 
 ```go
 registry := gateway.NewRegistry(system, logger,
-    gateway.WithOutbox(gateway.NewMemoryOutbox()),  // or persistence/redis for a cluster
+	gateway.WithOutbox(gateway.NewMemoryOutbox()),  // or persistence/redis for a cluster
+	gateway.WithOutboxEnvelope(),
 )
 
 // application, on receiving the client's ack frame:
@@ -784,17 +817,14 @@ at 1 on reboot and collide with a still-stored message, so two payloads could la
 `Outbox.DropConn` (or a `persistence/redis` `WithTTL`), which is also what keeps the store
 from accumulating one entry per connection id ever seen. Boundary: at-least-once means
 **duplicates are possible** - an unacked message is redelivered on reconnect even if the
-client did in fact receive it, so clients must dedupe on the `ID`/`Seq` they read back through
-`Outbox.Unacked`. Boundary: `SendToConnection` does not itself put `msgID`/`Seq` on the wire -
-it writes the raw `payload` `send` was given, same as without an `Outbox` - so an application
-wiring this in today must communicate the `msgID` to the client through its own framing (or
-have the client ack by an id derived from the payload it defines) for the very first delivery
-attempt; only a reconnect's `Outbox.Unacked` exposes `msgID`/`Seq` directly to the
-application. `EncodeOutboxEnvelope`/`DecodeOutboxEnvelope` in `persistence.go` are a ready,
-documented wire frame for closing this gap, but no handler wires them yet.
+client did in fact receive it, so clients must dedupe on the `ID`/`Seq` carried by the
+optional wire envelope. `WithOutboxEnvelope` makes real-time delivery and replay write the
+same ASCII base64 frame containing `msgID`, `Seq`, and the original payload. Decode it with
+`DecodeOutboxTextEnvelope`, then send that `msgID` to `Registry.Ack`. The default remains a
+raw payload for compatibility when `WithOutboxEnvelope` is absent; in that default mode,
+the application owns any wire framing used for its acknowledgements.
 `Registry.Ack` is a no-op returning nil when no `Outbox` is configured, so the call site is
-safe to keep unconditionally. The bare `send` primitive is unchanged: the library does not
-wrap the payload or impose a wire format, so your ack framing is yours to define.
+safe to keep unconditionally.
 
 ### Reauth and disconnect
 
@@ -856,13 +886,13 @@ one id (split brain). Sequential takeover - one node evicting an owner it can al
 works without anything below and is unaffected by it; what needs `WithOwnerLease` is a true
 race between two `Register` calls that never see each other's write in time.
 
-```go
-coordinator := rediscoordinator.New(client)  // must implement gateway.CASCoordinator;
-                                              // MemoryCoordinator and coordinator/redis both do
-registry := gateway.NewRegistry(system, logger,
-    gateway.WithOwnerLease(coordinator),
-)
-```
+`WithOwnerLease(c)` only accepts a `LinearizableFencingCoordinator`: a coordinator that explicitly
+declares linearizable fencing across failover. `NewMemoryCoordinator` supplies that
+capability for one process only. `coordinator/redis.New` deliberately does not supply it:
+Redis or Valkey remains valid for certificate coordination, but asynchronous replication can
+lose a completed CAS during failover and grant the same OwnerLease again. A multi-instance
+deployment must provide a consensus-backed `LinearizableFencingCoordinator`; this module does not ship a
+provider for that boundary.
 
 `WithOwnerLease(c)` makes every `Register` acquire a CAS-arbitrated lease for the connection
 id from `c` before publishing it locally. The lease value carries the owning node's id, a
@@ -944,6 +974,9 @@ background renewal goroutine per node; `WithOwnerLease` mirrors the
   (`presence/conformance`, `store/conformance`, `ssehistory/conformance`); the RESP
   backend of each is run against both a real Redis and a real Valkey server, so
   "interchangeable between Redis and Valkey" is a tested property.
+- `coordinator/redis` is suitable for certificate coordination, not strict multi-instance
+  connection ownership. `WithOwnerLease` requires a consensus-backed
+  `LinearizableFencingCoordinator`; Redis or Valkey failover cannot prove that fencing property.
 
 **Does not:**
 
@@ -992,9 +1025,9 @@ background renewal goroutine per node; `WithOwnerLease` mirrors the
 ## Development
 
 ```
-go build ./...
-go vet ./...
-go test -race ./...
+mise exec go@1.26.5 --command "go build ./..."
+mise exec go@1.26.5 --command "go vet ./..."
+mise exec go@1.26.5 --command "go test -race ./..."
 ```
 
 The five RESP backends (`coordinator/redis`, `presence/redis`, `store/redis`,
@@ -1005,8 +1038,8 @@ point, run the same suite against both. `docker-compose.yml` starts one of each:
 ```
 docker compose up -d                                          # redis on :6399, valkey on :6400
 
-TEST_REDIS_ADDR=127.0.0.1:6399 go test ./... -race -count=1   # against Redis
-TEST_REDIS_ADDR=127.0.0.1:6400 go test ./... -race -count=1   # against Valkey
+TEST_REDIS_ADDR=127.0.0.1:6399 mise exec go@1.26.5 --command "go test ./... -race -count=1"   # against Redis
+TEST_REDIS_ADDR=127.0.0.1:6400 mise exec go@1.26.5 --command "go test ./... -race -count=1"   # against Valkey
 
 docker compose down
 ```
@@ -1015,10 +1048,10 @@ Both runs must show `coordinator/redis`, `presence/redis`, `store/redis`,
 `ssehistory/redis`, and `persistence/redis` as `ok` (not `[no test files]` or skipped),
 and `presence/redis`'s Watch/Directory tests run under the same gate. Point `TEST_REDIS_ADDR` at
 any single instance to run just one backend, e.g.
-`TEST_REDIS_ADDR=127.0.0.1:6399 go test ./store/redis/...`.
+`TEST_REDIS_ADDR=127.0.0.1:6399 mise exec go@1.26.5 --command "go test ./store/redis/..."`.
 
 ## See also
 
 - [GoAkt](https://github.com/Tochemey/goakt) - the actor system this library sits on top of.
 - [CHANGELOG.md](./CHANGELOG.md) - breaking changes and migration notes.
-- [`examples/`](./examples) - seven runnable samples, indexed above.
+- [`examples/`](./examples) - twelve runnable samples, indexed above.

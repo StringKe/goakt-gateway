@@ -58,6 +58,23 @@ func newRaceTestSystem(t *testing.T, opts ...actor.Option) actor.ActorSystem {
 	return system
 }
 
+func TestConfirmRemoteGroupReturnsContextCancellationBeforeFanout(t *testing.T) {
+	ctx := context.Background()
+	presence := NewMemoryPresence()
+	for i := 0; i < maxConcurrentConfirmAsks+1; i++ {
+		require.NoError(t, presence.Join(ctx, "cancelled-group", fmt.Sprintf("remote-%d", i), time.Minute))
+	}
+	registry := NewRegistry(newRaceTestSystem(t), log.DiscardLogger,
+		WithPresence(presence),
+		WithDeliveryConfirmation(),
+	)
+	cancelled, cancel := context.WithCancel(ctx)
+	cancel()
+
+	_, err := registry.confirmRemoteGroup(cancelled, "cancelled-group", []byte("payload"))
+	require.ErrorIs(t, err, context.Canceled)
+}
+
 // stubFailingPresence lets a test force a Register's finalize step to fail on demand, so the
 // registration is steered onto its rollback path. Its Join returns an error while failJoin
 // is set; every other method is a no-op.

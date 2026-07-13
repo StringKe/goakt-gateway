@@ -79,6 +79,31 @@ func TestFileCertStoreGetMissing(t *testing.T) {
 	require.ErrorIs(t, err, gateway.ErrCertificateNotFound)
 }
 
+func TestMemoryCertStoreOwnsCertificateMaterial(t *testing.T) {
+	store := gateway.NewMemoryCertStore()
+	original := &gateway.Certificate{
+		Domain:   "owned.example.com",
+		CertPEM:  []byte("certificate"),
+		KeyPEM:   []byte("private-key"),
+		NotAfter: time.Now().Add(time.Hour),
+	}
+	require.NoError(t, store.Put(context.Background(), original))
+
+	original.CertPEM[0] = 'X'
+	original.KeyPEM[0] = 'X'
+	first, err := store.Get(context.Background(), original.Domain)
+	require.NoError(t, err)
+	require.Equal(t, []byte("certificate"), first.CertPEM)
+	require.Equal(t, []byte("private-key"), first.KeyPEM)
+
+	first.CertPEM[0] = 'Y'
+	first.KeyPEM[0] = 'Y'
+	second, err := store.Get(context.Background(), original.Domain)
+	require.NoError(t, err)
+	require.Equal(t, []byte("certificate"), second.CertPEM)
+	require.Equal(t, []byte("private-key"), second.KeyPEM)
+}
+
 // TestFileCertStoreRejectsUnsafeDomains verifies that a domain name (which ultimately comes
 // from the peer-supplied SNI server name) cannot be used to read or write a file outside the
 // store directory.

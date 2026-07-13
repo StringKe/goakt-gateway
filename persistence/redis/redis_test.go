@@ -135,6 +135,26 @@ func TestRedisOutboxAckAddsGenerationField(t *testing.T) {
 	require.ElementsMatch(t, []string{"\x00seq", "\x00ackgen"}, fields, "the acked message field must be gone")
 }
 
+func TestRedisOutboxAdvanceGenerationDoesNotCreateEmptyState(t *testing.T) {
+	client := testClient(t)
+	ctx := context.Background()
+
+	var counter atomic.Int64
+	prefix := uniquePrefix(&counter)
+	outbox := gatewayredis.New(client, gatewayredis.WithKeyPrefix(prefix))
+	key := prefix + "unused"
+	t.Cleanup(func() { _ = client.Del(ctx, key).Err() })
+
+	require.NoError(t, outbox.AdvanceGeneration(ctx, "unused", 3))
+	exists, err := client.Exists(ctx, key).Result()
+	require.NoError(t, err)
+	require.Zero(t, exists)
+
+	msgID, _, err := outbox.Append(ctx, "unused", []byte("payload"))
+	require.NoError(t, err)
+	require.NoError(t, outbox.Ack(ctx, "unused", msgID, 0))
+}
+
 // TestRedisOutboxNoTTLByDefault proves an Outbox without WithTTL retains the tail
 // indefinitely, so nothing but Ack or DropConn removes it.
 func TestRedisOutboxNoTTLByDefault(t *testing.T) {

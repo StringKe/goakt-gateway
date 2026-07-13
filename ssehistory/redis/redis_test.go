@@ -28,6 +28,7 @@ package redis_test
 
 import (
 	"context"
+	"encoding/base64"
 	"fmt"
 	"os"
 	"sync"
@@ -72,6 +73,17 @@ func uniquePrefix(counter *atomic.Int64) string {
 	return fmt.Sprintf("goakt-gateway-test-%d-%d:ssehistory:", processRunID, counter.Add(1))
 }
 
+func historyKeys(prefix, connID string) (string, string) {
+	tag := base64.RawURLEncoding.EncodeToString([]byte(connID))
+	return prefix + "events:{" + tag + "}", prefix + "state:{" + tag + "}"
+}
+
+func deleteHistory(t *testing.T, client *redis.Client, prefix, connID string) {
+	t.Helper()
+	eventKey, stateKey := historyKeys(prefix, connID)
+	t.Cleanup(func() { _ = client.Del(context.Background(), eventKey, stateKey).Err() })
+}
+
 func TestRedisHistoryConformance(t *testing.T) {
 	client := testClient(t)
 
@@ -86,8 +98,7 @@ func TestRedisHistoryConformance(t *testing.T) {
 	})
 }
 
-// TestRedisHistoryKeyLayout pins the key shape down: one LIST per connection, under the
-// configured prefix, whose elements are the retained events in wire order.
+// TestRedisHistoryKeyLayout pins the same-slot LIST and HASH layout down.
 func TestRedisHistoryKeyLayout(t *testing.T) {
 	client := testClient(t)
 	ctx := context.Background()
@@ -95,19 +106,29 @@ func TestRedisHistoryKeyLayout(t *testing.T) {
 	var counter atomic.Int64
 	prefix := uniquePrefix(&counter)
 	history := gatewayredis.New(client, gatewayredis.WithKeyPrefix(prefix))
-	key := prefix + "conn-1"
-	t.Cleanup(func() { _ = client.Del(ctx, key).Err() })
+	eventKey, stateKey := historyKeys(prefix, "conn-1")
+	deleteHistory(t, client, prefix, "conn-1")
 
 	require.NoError(t, history.Append(ctx, "conn-1", "e-1", []byte("one")))
 	require.NoError(t, history.Append(ctx, "conn-1", "e-2", []byte("two")))
 
-	kind, err := client.Type(ctx, key).Result()
+	kind, err := client.Type(ctx, eventKey).Result()
 	require.NoError(t, err)
 	require.Equal(t, "list", kind)
 
-	length, err := client.LLen(ctx, key).Result()
+	length, err := client.LLen(ctx, eventKey).Result()
 	require.NoError(t, err)
 	require.EqualValues(t, 2, length)
+	require.Equal(t, "none", mustType(t, client, ctx, stateKey))
+	require.Equal(t, prefix+"events:{Y29ubi0x}", eventKey)
+	require.Equal(t, prefix+"state:{Y29ubi0x}", stateKey)
+}
+
+func mustType(t *testing.T, client *redis.Client, ctx context.Context, key string) string {
+	t.Helper()
+	kind, err := client.Type(ctx, key).Result()
+	require.NoError(t, err)
+	return kind
 }
 
 // TestRedisHistoryPerConnOverflow proves the LTRIM bound drops the oldest events once more
@@ -120,7 +141,7 @@ func TestRedisHistoryPerConnOverflow(t *testing.T) {
 	var counter atomic.Int64
 	prefix := uniquePrefix(&counter)
 	history := gatewayredis.New(client, gatewayredis.WithKeyPrefix(prefix), gatewayredis.WithPerConn(3))
-	t.Cleanup(func() { _ = client.Del(ctx, prefix+"conn-1").Err() })
+	deleteHistory(t, client, prefix, "conn-1")
 
 	for i := 1; i <= 5; i++ {
 		require.NoError(t, history.Append(ctx, "conn-1", fmt.Sprintf("e-%d", i), fmt.Appendf(nil, "p%d", i)))
@@ -140,37 +161,25 @@ func TestRedisHistoryPerConnOverflow(t *testing.T) {
 	require.Len(t, events, 3)
 }
 
-// TestRedisHistorySinceExcludesGenerationMarkers proves a marker AdvanceGeneration wrote never
-// leaks into Since's output, whether the reconnect asks for everything or for events after a
-// real id that precedes the marker in wire order - covering the filter running both before and
-// interleaved with the Last-Event-ID search.
-func TestRedisHistorySinceExcludesGenerationMarkers(t *testing.T) {
+// TestRedisHistoryAdvanceGenerationDoesNotConsumeEventCapacity proves a state-only takeover
+// leaves all perConn real events replayable.
+func TestRedisHistoryAdvanceGenerationDoesNotConsumeEventCapacity(t *testing.T) {
 	client := testClient(t)
 	ctx := context.Background()
 
 	var counter atomic.Int64
 	prefix := uniquePrefix(&counter)
-	history := gatewayredis.New(client, gatewayredis.WithKeyPrefix(prefix))
+	history := gatewayredis.New(client, gatewayredis.WithKeyPrefix(prefix), gatewayredis.WithPerConn(1))
 	var generational gateway.GenerationalHistory = history
-	t.Cleanup(func() { _ = client.Del(ctx, prefix+"conn-1").Err() })
+	deleteHistory(t, client, prefix, "conn-1")
 
 	_, err := generational.AppendGenerational(ctx, "conn-1", "e-1", []byte("one"), 1)
 	require.NoError(t, err)
 	require.NoError(t, generational.AdvanceGeneration(ctx, "conn-1", 2))
-	_, err = generational.AppendGenerational(ctx, "conn-1", "e-2", []byte("two"), 2)
-	require.NoError(t, err)
 
 	events, err := history.Since(ctx, "conn-1", "")
 	require.NoError(t, err)
-	require.Equal(t, []gateway.SSEEvent{
-		{ID: "e-1", Payload: []byte("one")},
-		{ID: "e-2", Payload: []byte("two")},
-	}, events, "the marker AdvanceGeneration wrote between e-1 and e-2 must not appear")
-
-	events, err = history.Since(ctx, "conn-1", "e-1")
-	require.NoError(t, err)
-	require.Equal(t, []gateway.SSEEvent{{ID: "e-2", Payload: []byte("two")}}, events,
-		"the marker between the requested id and the next real event must still be filtered")
+	require.Equal(t, []gateway.SSEEvent{{ID: "e-1", Payload: []byte("one")}}, events)
 }
 
 // TestRedisHistoryTTLReclaims proves the idle TTL reclaims a connection's buffer: after the
@@ -187,7 +196,7 @@ func TestRedisHistoryTTLReclaims(t *testing.T) {
 		gatewayredis.WithKeyPrefix(prefix),
 		gatewayredis.WithTTL(time.Second),
 	)
-	t.Cleanup(func() { _ = client.Del(ctx, prefix+"conn-1").Err() })
+	deleteHistory(t, client, prefix, "conn-1")
 
 	require.NoError(t, history.Append(ctx, "conn-1", "e-1", []byte("one")))
 
@@ -219,11 +228,11 @@ func TestRedisHistoryAppendRefreshesTTL(t *testing.T) {
 		gatewayredis.WithKeyPrefix(prefix),
 		gatewayredis.WithTTL(30*time.Second),
 	)
-	key := prefix + "conn-1"
-	t.Cleanup(func() { _ = client.Del(ctx, key).Err() })
+	eventKey, _ := historyKeys(prefix, "conn-1")
+	deleteHistory(t, client, prefix, "conn-1")
 
 	require.NoError(t, history.Append(ctx, "conn-1", "e-1", []byte("one")))
-	ttl, err := client.PTTL(ctx, key).Result()
+	ttl, err := client.PTTL(ctx, eventKey).Result()
 	require.NoError(t, err)
 	require.Positive(t, ttl, "each connection key must carry the idle TTL")
 	require.LessOrEqual(t, ttl, 30*time.Second)
@@ -244,7 +253,7 @@ func TestRedisHistoryRefreshTTLKeepsLiveStream(t *testing.T) {
 		gatewayredis.WithKeyPrefix(prefix),
 		gatewayredis.WithTTL(time.Second),
 	)
-	t.Cleanup(func() { _ = client.Del(ctx, prefix+"conn-1").Err() })
+	deleteHistory(t, client, prefix, "conn-1")
 
 	require.NoError(t, history.Append(ctx, "conn-1", "e-1", []byte("one")))
 
@@ -292,7 +301,7 @@ func TestRedisHistoryAppendGenerationalAssignsIncreasingSeq(t *testing.T) {
 	prefix := uniquePrefix(&counter)
 	history := gatewayredis.New(client, gatewayredis.WithKeyPrefix(prefix))
 	var generational gateway.GenerationalHistory = history
-	t.Cleanup(func() { _ = client.Del(ctx, prefix+"conn-1").Err() })
+	deleteHistory(t, client, prefix, "conn-1")
 
 	seq1, err := generational.AppendGenerational(ctx, "conn-1", "e-1", []byte("one"), 1)
 	require.NoError(t, err)
@@ -327,7 +336,7 @@ func TestRedisHistoryAppendGenerationalRejectsStaleGeneration(t *testing.T) {
 	prefix := uniquePrefix(&counter)
 	history := gatewayredis.New(client, gatewayredis.WithKeyPrefix(prefix))
 	var generational gateway.GenerationalHistory = history
-	t.Cleanup(func() { _ = client.Del(ctx, prefix+"conn-1").Err() })
+	deleteHistory(t, client, prefix, "conn-1")
 
 	_, err := generational.AppendGenerational(ctx, "conn-1", "e-1", []byte("one"), 5)
 	require.NoError(t, err)
@@ -359,7 +368,7 @@ func TestRedisHistoryAdvanceGenerationFencesSubsequentStaleAppend(t *testing.T) 
 	prefix := uniquePrefix(&counter)
 	history := gatewayredis.New(client, gatewayredis.WithKeyPrefix(prefix))
 	var generational gateway.GenerationalHistory = history
-	t.Cleanup(func() { _ = client.Del(ctx, prefix+"conn-1").Err() })
+	deleteHistory(t, client, prefix, "conn-1")
 
 	require.NoError(t, generational.AdvanceGeneration(ctx, "conn-1", 2))
 
@@ -387,7 +396,7 @@ func TestRedisHistoryAdvanceGenerationIsNoOpWhenNotGreater(t *testing.T) {
 	prefix := uniquePrefix(&counter)
 	history := gatewayredis.New(client, gatewayredis.WithKeyPrefix(prefix))
 	var generational gateway.GenerationalHistory = history
-	t.Cleanup(func() { _ = client.Del(ctx, prefix+"conn-1").Err() })
+	deleteHistory(t, client, prefix, "conn-1")
 
 	require.NoError(t, generational.AdvanceGeneration(ctx, "conn-1", 5))
 	require.NoError(t, generational.AdvanceGeneration(ctx, "conn-1", 5), "equal generation must be a no-op, not an error")
@@ -395,6 +404,38 @@ func TestRedisHistoryAdvanceGenerationIsNoOpWhenNotGreater(t *testing.T) {
 
 	_, err := generational.AppendGenerational(ctx, "conn-1", "e-stale", []byte("stale"), 4)
 	require.ErrorIs(t, err, gateway.ErrStaleGeneration, "generation 5 must still be enforced after the no-op calls")
+}
+
+// TestRedisHistoryPlainAppendPreservesGenerationState proves a non-generational caller cannot
+// reset a shared connection's takeover fence or generational sequence by appending after it.
+func TestRedisHistoryPlainAppendPreservesGenerationState(t *testing.T) {
+	client := testClient(t)
+	ctx := context.Background()
+
+	var counter atomic.Int64
+	prefix := uniquePrefix(&counter)
+	history := gatewayredis.New(client, gatewayredis.WithKeyPrefix(prefix), gatewayredis.WithPerConn(4))
+	var generational gateway.GenerationalHistory = history
+	deleteHistory(t, client, prefix, "conn-1")
+
+	seq, err := generational.AppendGenerational(ctx, "conn-1", "g-1", []byte("first"), 2)
+	require.NoError(t, err)
+	require.EqualValues(t, 1, seq)
+	require.NoError(t, history.Append(ctx, "conn-1", "plain", []byte("plain")))
+
+	_, err = generational.AppendGenerational(ctx, "conn-1", "stale", []byte("stale"), 1)
+	require.ErrorIs(t, err, gateway.ErrStaleGeneration)
+	seq, err = generational.AppendGenerational(ctx, "conn-1", "g-2", []byte("second"), 2)
+	require.NoError(t, err)
+	require.EqualValues(t, 2, seq)
+
+	require.NoError(t, generational.AdvanceGeneration(ctx, "conn-1", 3))
+	require.NoError(t, generational.AdvanceGeneration(ctx, "conn-1", 4))
+	_, err = generational.AppendGenerational(ctx, "conn-1", "stale-2", []byte("stale"), 3)
+	require.ErrorIs(t, err, gateway.ErrStaleGeneration)
+	seq, err = generational.AppendGenerational(ctx, "conn-1", "g-4", []byte("fourth"), 4)
+	require.NoError(t, err)
+	require.EqualValues(t, 3, seq)
 }
 
 // TestRedisHistoryAppendGenerationalConcurrentRejectsStaleAndKeepsSeqUnique drives many
@@ -410,7 +451,7 @@ func TestRedisHistoryAppendGenerationalConcurrentRejectsStaleAndKeepsSeqUnique(t
 	prefix := uniquePrefix(&counter)
 	history := gatewayredis.New(client, gatewayredis.WithKeyPrefix(prefix), gatewayredis.WithPerConn(256))
 	var generational gateway.GenerationalHistory = history
-	t.Cleanup(func() { _ = client.Del(ctx, prefix+"conn-1").Err() })
+	deleteHistory(t, client, prefix, "conn-1")
 
 	// Two "generations" of writers race to append. Every generation-2 write must eventually
 	// fence out every generation-1 write that loses the race (or all of them, if generation 2
@@ -474,7 +515,7 @@ func TestRedisHistorySharesOneBackend(t *testing.T) {
 	prefix := uniquePrefix(&counter)
 	nodeA := gatewayredis.New(client, gatewayredis.WithKeyPrefix(prefix))
 	nodeB := gatewayredis.New(client, gatewayredis.WithKeyPrefix(prefix))
-	t.Cleanup(func() { _ = client.Del(ctx, prefix+"conn-1").Err() })
+	deleteHistory(t, client, prefix, "conn-1")
 
 	require.NoError(t, nodeA.Append(ctx, "conn-1", "e-1", []byte("one")))
 	require.NoError(t, nodeA.Append(ctx, "conn-1", "e-2", []byte("two")))
@@ -496,9 +537,8 @@ func TestRedisHistoryPrefixIsolation(t *testing.T) {
 	prefixB := uniquePrefix(&counter)
 	deploymentA := gatewayredis.New(client, gatewayredis.WithKeyPrefix(prefixA))
 	deploymentB := gatewayredis.New(client, gatewayredis.WithKeyPrefix(prefixB))
-	t.Cleanup(func() {
-		_ = client.Del(ctx, prefixA+"conn-1", prefixB+"conn-1").Err()
-	})
+	deleteHistory(t, client, prefixA, "conn-1")
+	deleteHistory(t, client, prefixB, "conn-1")
 
 	require.NoError(t, deploymentA.Append(ctx, "conn-1", "e-1", []byte("one")))
 

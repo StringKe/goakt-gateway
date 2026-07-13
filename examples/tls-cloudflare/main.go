@@ -137,7 +137,7 @@ func buildCoordinator(ctx context.Context) (gateway.Coordinator, string) {
 // FileCertStore so the example still runs with no server. It deliberately shares one
 // Redis/Valkey instance with buildCoordinator under the same key prefix: the store's keys
 // carry a "cert:" infix that keeps them from colliding with the coordinator's, which is the
-// intended "four backends, one instance, distinct namespaces" deployment. The returned
+// intended "five backends, one instance, distinct namespaces" deployment. The returned
 // closer releases whatever resource the store holds (a Redis client, or a temp directory).
 func buildCertStore(ctx context.Context) (gateway.CertStore, string, func()) {
 	addr := os.Getenv("REDIS_ADDR")

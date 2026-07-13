@@ -252,7 +252,8 @@ type Manager struct {
 	certs     *lruCache[*cachedCert]
 	negatives *lruCache[negativeEntry]
 
-	renewalPID *actor.PID
+	lifecycleMu sync.Mutex
+	renewalPID  *actor.PID
 }
 
 // ManagerOption configures a Manager created with NewManager.
@@ -393,6 +394,9 @@ func NewManager(system actor.ActorSystem, logger log.Logger, opts ...ManagerOpti
 	if m.maxCachedCerts <= 0 {
 		m.maxCachedCerts = defaultMaxCachedCerts
 	}
+	if m.lockTTL <= 0 {
+		m.lockTTL = defaultLockTTL
+	}
 	m.certs = newLRUCache[*cachedCert](m.maxCachedCerts)
 	m.negatives = newLRUCache[negativeEntry](m.maxCachedCerts)
 	return m
@@ -401,11 +405,16 @@ func NewManager(system actor.ActorSystem, logger log.Logger, opts ...ManagerOpti
 // Start registers the renewal schedule (cluster-single-fire when system is running in a
 // GoAkt cluster, driven by the schedule reference rather than by actor identity - see
 // certRenewalActorNamePrefix). It is a no-op if renewal was disabled via
-// WithRenewInterval(""). Each call spawns its own uniquely-named local renewal actor, so
-// calling Start from every node of a cluster (the normal deployment shape) does not fail
-// with ErrActorAlreadyExists.
+// WithRenewInterval(""). Concurrent calls for the same Manager share one local renewal
+// actor, while distinct Managers on separate nodes use unique names.
 func (m *Manager) Start(ctx context.Context) error {
+	m.lifecycleMu.Lock()
+	defer m.lifecycleMu.Unlock()
+
 	if m.renewInterval == "" {
+		return nil
+	}
+	if m.renewalPID != nil {
 		return nil
 	}
 
@@ -414,26 +423,29 @@ func (m *Manager) Start(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("gateway: failed to start certificate renewal actor: %w", err)
 	}
-	m.renewalPID = pid
 
 	if err := m.system.ScheduleWithCron(ctx, &emptypb.Empty{}, pid, m.renewInterval,
 		actor.WithReference(certRenewalReference),
 	); err != nil {
-		return fmt.Errorf("gateway: failed to register certificate renewal schedule: %w", err)
+		shutdownErr := pid.Shutdown(context.WithoutCancel(ctx))
+		return fmt.Errorf("gateway: failed to register certificate renewal schedule: %w", errors.Join(err, shutdownErr))
 	}
+	m.renewalPID = pid
 	return nil
 }
 
 // Stop cancels the renewal schedule and stops its backing actor. It is a no-op if Start
 // was never called or renewal was disabled.
 func (m *Manager) Stop(ctx context.Context) error {
-	if m.renewalPID == nil {
+	m.lifecycleMu.Lock()
+	defer m.lifecycleMu.Unlock()
+
+	pid := m.renewalPID
+	if pid == nil {
 		return nil
 	}
-	_ = m.system.CancelSchedule(certRenewalReference)
-	err := m.renewalPID.Shutdown(ctx)
 	m.renewalPID = nil
-	return err
+	return errors.Join(m.system.CancelSchedule(certRenewalReference), pid.Shutdown(ctx))
 }
 
 // GetCertificate implements the tls.Config.GetCertificate signature for SNI-based

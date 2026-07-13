@@ -46,6 +46,16 @@ type Certificate struct {
 	NotAfter time.Time
 }
 
+func cloneCertificate(cert *Certificate) *Certificate {
+	if cert == nil {
+		return nil
+	}
+	clone := *cert
+	clone.CertPEM = append([]byte(nil), cert.CertPEM...)
+	clone.KeyPEM = append([]byte(nil), cert.KeyPEM...)
+	return &clone
+}
+
 // CertIssuer obtains a certificate for a domain. Manager arbitrates calls to Issue so
 // that, when using a cluster-shared Coordinator, at most one node calls it for a given
 // domain at a time (see Manager.EnsureCertificate).
@@ -72,9 +82,12 @@ var _ CertIssuer = (*StaticIssuer)(nil)
 func NewStaticIssuer(cert *Certificate, domains ...string) *StaticIssuer {
 	issuer := &StaticIssuer{certs: make(map[string]*Certificate, len(domains))}
 	for _, domain := range domains {
-		clone := *cert
+		clone := cloneCertificate(cert)
+		if clone == nil {
+			continue
+		}
 		clone.Domain = domain
-		issuer.certs[domain] = &clone
+		issuer.certs[domain] = clone
 	}
 	return issuer
 }
@@ -85,7 +98,7 @@ func (s *StaticIssuer) Issue(_ context.Context, domain string) (*Certificate, er
 	if !ok {
 		return nil, fmt.Errorf("gateway: no static certificate configured for domain %q", domain)
 	}
-	return cert, nil
+	return cloneCertificate(cert), nil
 }
 
 // CloudflareOriginCAIssuer issues certificates through the Cloudflare Origin CA REST

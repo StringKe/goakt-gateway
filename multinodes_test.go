@@ -182,8 +182,6 @@ func TestGatewayMultiNodesBroadcast(t *testing.T) {
 	}
 
 	require.NoError(t, registryA.Register(ctx, "bridge-member", send, gateway.WithConnTopics("cross-node-room")))
-	// give the topic actor's cluster dissemination time to establish before publishing.
-	time.Sleep(2 * time.Second)
 
 	_, err := registryB.Broadcast(ctx, "cross-node-room", []byte("hello-from-node-b"))
 	require.NoError(t, err)

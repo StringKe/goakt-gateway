@@ -107,8 +107,12 @@ func main() {
 	}
 
 	nodes := make([]*node, 0, len(specs))
+	var ownerLease gateway.Coordinator
+	if multiNode {
+		ownerLease = gateway.NewMemoryCoordinator()
+	}
 	for _, spec := range specs {
-		n, err := startNode(ctx, spec.name, spec.addr, history)
+		n, err := startNode(ctx, spec.name, spec.addr, history, ownerLease)
 		if err != nil {
 			log.Fatalf("start node %s: %v", spec.name, err)
 		}
@@ -192,7 +196,7 @@ func buildHistory(ctx context.Context) (history gateway.SSEHistory, multiNode bo
 // nodes are not GoAkt-clustered (there is no WithCluster): every node runs its own pubsub
 // and the ticker broadcasts to each independently. What ties them together is the shared
 // SSEHistory, not a gossip membership.
-func startNode(ctx context.Context, name, addr string, history gateway.SSEHistory) (*node, error) {
+func startNode(ctx context.Context, name, addr string, history gateway.SSEHistory, ownerLease gateway.Coordinator) (*node, error) {
 	// WithPubSub is required: /events auto-joins every connection to tickerTopic, and
 	// Registry.Join/Broadcast both need the underlying actor system's pubsub bridge.
 	system, err := actor.NewActorSystem("gateway-sse-resume-"+name,
@@ -206,7 +210,11 @@ func startNode(ctx context.Context, name, addr string, history gateway.SSEHistor
 		return nil, err
 	}
 
-	registry := gateway.NewRegistry(system, golog.DiscardLogger)
+	registryOptions := []gateway.RegistryOption{}
+	if ownerLease != nil {
+		registryOptions = append(registryOptions, gateway.WithOwnerLease(ownerLease))
+	}
+	registry := gateway.NewRegistry(system, golog.DiscardLogger, registryOptions...)
 
 	nodeName := name
 	sseHandler := gateway.NewSSEHandler(registry,

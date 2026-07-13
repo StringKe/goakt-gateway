@@ -13,7 +13,8 @@ for a gateway library - most traffic (presence pings, ephemeral cursor positions
 typing indicators) is not worth paying storage and latency for - but some traffic is: a
 support ticket update, an order status change, a message a human is expected to read.
 
-`WithOutbox` upgrades exactly that traffic, without changing anything for the rest:
+`WithOutbox` plus `WithOutboxEnvelope` upgrades exactly that traffic without changing the
+default raw payload format for callers that do not opt in:
 
 - `Registry.SendToConnection` persists the payload to the `Outbox` **before** it is written
   to a socket, whether or not a socket for that connection id currently exists anywhere.
@@ -26,17 +27,9 @@ support ticket update, an order status change, a message a human is expected to 
   catches up on everything it missed with zero extra application code.
 - `Registry.Ack` is how redelivery stops. Without it, a message sits in the `Outbox` forever
   (or until a configured TTL expires it) and is redelivered on every future reconnect.
-
-The one piece of plumbing this demo has to supply itself: `SendToConnection` deliberately
-keeps its signature `(ctx, id, payload) error` - it does not hand back the id the `Outbox`
-assigned the message internally, because doing so would mean either returning a second value
-every caller has to thread through, or reaching into the payload bytes to inject one, both of
-which compromise the "send is a raw `[]byte` in, `error` out" primitive the whole library is
-built on. So the wire message this demo sends carries its own application-level id (a UUID,
-distinct from the `Outbox`'s internal id), and when a client acks that id, the handler
-recovers the `Outbox`'s internal id the way the library's own tests do: read the connection's
-unacknowledged tail back with `Outbox.Unacked` and match on it. See the `ackHandler` doc
-comment in `main.go` for the exact reasoning.
+- `WithOutboxEnvelope` makes real-time delivery and replay use the same base64 text frame.
+  It carries the Outbox message id, sequence, and original payload. The browser decodes the
+  frame and sends the message id directly to `Registry.Ack`, without scanning `Unacked`.
 
 ### At-least-once, not exactly-once
 
@@ -49,7 +42,7 @@ disabling auto-ack and reconnecting, so a duplicate becomes visible instead of t
 
 ## Files
 
-- `main.go` - the server: a `gateway.Registry` with `WithOutbox`, a `WSHandler` that acks
+- `main.go` - the server: a `gateway.Registry` with `WithOutbox` and `WithOutboxEnvelope`, a `WSHandler` that acks
   inbound frames and (via `Register`, called during the handshake) redelivers on reconnect,
   and three plain HTTP endpoints (`/send`, `/unacked`, `/`) plus the demo page.
 - `README.md` - this file.

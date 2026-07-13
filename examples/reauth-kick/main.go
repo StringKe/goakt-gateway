@@ -199,7 +199,9 @@ func adminRevokeHandler(perms *permissionStore) http.HandlerFunc {
 			return
 		}
 		perms.revoke(user)
-		fmt.Fprintf(w, "revoked access for %q; open connections will be closed within %s\n", user, reauthInterval)
+		if _, err := fmt.Fprintf(w, "revoked access for %q; open connections will be closed within %s\n", user, reauthInterval); err != nil {
+			log.Printf("write revoke response: %v", err)
+		}
 	}
 }
 
@@ -213,7 +215,9 @@ func adminGrantHandler(perms *permissionStore) http.HandlerFunc {
 			return
 		}
 		perms.grant(user)
-		fmt.Fprintf(w, "granted access for %q\n", user)
+		if _, err := fmt.Fprintf(w, "granted access for %q\n", user); err != nil {
+			log.Printf("write grant response: %v", err)
+		}
 	}
 }
 
@@ -236,7 +240,9 @@ func adminKickHandler(registry *gateway.Registry) http.HandlerFunc {
 			http.Error(w, err.Error(), http.StatusNotFound)
 			return
 		}
-		fmt.Fprintf(w, "disconnected %q: %s\n", id, reason)
+		if _, err := fmt.Fprintf(w, "disconnected %q: %s\n", id, reason); err != nil {
+			log.Printf("write disconnect response: %v", err)
+		}
 	}
 }
 
@@ -260,7 +266,9 @@ func adminKickGroupHandler(registry *gateway.Registry) http.HandlerFunc {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
-		fmt.Fprintf(w, "disconnected %d connection(s) of %q: %s\n", n, user, reason)
+		if _, err := fmt.Fprintf(w, "disconnected %d connection(s) of %q: %s\n", n, user, reason); err != nil {
+			log.Printf("write group disconnect response: %v", err)
+		}
 	}
 }
 

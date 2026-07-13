@@ -139,6 +139,45 @@ type gatedOffline struct {
 	got     chan []byte
 }
 
+type cancellableOffline struct {
+	started chan struct{}
+}
+
+func (c *cancellableOffline) Deliver(ctx context.Context, _ string, _ []byte) error {
+	c.started <- struct{}{}
+	<-ctx.Done()
+	return ctx.Err()
+}
+
+func TestRegistryCloseCancelsOfflineFallback(t *testing.T) {
+	system := newTestSystem(t)
+	offline := &cancellableOffline{started: make(chan struct{}, 1)}
+	registry := gateway.NewRegistry(system, log.DiscardLogger,
+		gateway.WithPresence(gateway.NewMemoryPresence()),
+		gateway.WithOfflineChannel(offline),
+	)
+
+	result, err := registry.SendToGroup(context.Background(), "user:absent", []byte("m"))
+	require.NoError(t, err)
+	require.True(t, result.None())
+	select {
+	case <-offline.started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("offline fallback did not start")
+	}
+
+	closed := make(chan struct{})
+	go func() {
+		_ = registry.Close(context.Background())
+		close(closed)
+	}()
+	select {
+	case <-closed:
+	case <-time.After(2 * time.Second):
+		t.Fatal("registry close did not cancel the offline fallback")
+	}
+}
+
 func (g *gatedOffline) Deliver(_ context.Context, _ string, payload []byte) error {
 	<-g.proceed
 	seen := make([]byte, len(payload))
