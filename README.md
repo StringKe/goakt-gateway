@@ -1054,4 +1054,7 @@ any single instance to run just one backend, e.g.
 
 - [GoAkt](https://github.com/Tochemey/goakt) - the actor system this library sits on top of.
 - [CHANGELOG.md](./CHANGELOG.md) - breaking changes and migration notes.
+- [CONTRIBUTING.md](https://github.com/StringKe/goakt-gateway/blob/main/CONTRIBUTING.md) - local verification and pull request requirements.
+- [SECURITY.md](https://github.com/StringKe/goakt-gateway/blob/main/SECURITY.md) - private vulnerability reporting policy.
+- [SUPPORT.md](https://github.com/StringKe/goakt-gateway/blob/main/SUPPORT.md) - issue and support routing.
 - [`examples/`](./examples) - twelve runnable samples, indexed above.
