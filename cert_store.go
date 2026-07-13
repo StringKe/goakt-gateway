@@ -116,6 +116,7 @@ func (m *MemoryCertStore) Delete(_ context.Context, domain string) error {
 // can produce and consume.
 type FileCertStore struct {
 	dir string
+	mu  sync.RWMutex
 }
 
 // enforce compilation error
@@ -135,15 +136,13 @@ func NewFileCertStore(dir string) (*FileCertStore, error) {
 
 // Get implements CertStore.
 //
-// Put renames the .crt file into place and then the .key file, two operations that are each
-// atomic but not atomic together, so a Get racing a renewal can briefly observe the new
-// certificate beside the not-yet-replaced old key (or the reverse). To keep the pair swap
-// all-or-nothing to callers - the way MemoryCertStore's map write and store/redis's single-key
-// SET already are - Get re-reads on a cert/key mismatch a bounded number of times; a torn pair
-// is transient and the retry sees both files settled. A pair that stays mismatched across every
-// retry is a genuinely inconsistent on-disk state (e.g. a pair an external tool wrote wrong),
-// which is returned as read and left for the TLS layer to reject rather than looped on forever.
+// FileCertStore serializes its own Put and Delete operations against Get, so a caller using one
+// store instance never observes the gap between the two file renames. The bounded retry remains
+// for pairs written by external tools, which cannot participate in this in-process lock.
 func (f *FileCertStore) Get(_ context.Context, domain string) (*Certificate, error) {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+
 	certPath, keyPath, err := f.paths(domain)
 	if err != nil {
 		return nil, err
@@ -195,6 +194,9 @@ func (f *FileCertStore) Get(_ context.Context, domain string) (*Certificate, err
 // only then starting to write and fsync the key temp would instead hold that mismatched pair
 // on disk for as long as the key's fsync takes (milliseconds), far too long for Get to hide.
 func (f *FileCertStore) Put(_ context.Context, cert *Certificate) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
 	certPath, keyPath, err := f.paths(cert.Domain)
 	if err != nil {
 		return err
@@ -223,6 +225,9 @@ func (f *FileCertStore) Put(_ context.Context, cert *Certificate) error {
 
 // Delete implements CertStore.
 func (f *FileCertStore) Delete(_ context.Context, domain string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
 	certPath, keyPath, err := f.paths(domain)
 	if err != nil {
 		return err
