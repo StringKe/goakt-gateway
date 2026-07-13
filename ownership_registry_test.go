@@ -37,6 +37,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/tochemey/goakt/v4/actor"
+	gerrors "github.com/tochemey/goakt/v4/errors"
 	"github.com/tochemey/goakt/v4/log"
 )
 
@@ -520,4 +521,42 @@ func TestOwnerLeaseAdvanceGenerationFailureRollsBackRegistration(t *testing.T) {
 	require.Equal(t, 0, registry.Len())
 	require.ErrorIs(t, registry.SendToConnection(context.Background(), "advance-failure-conn", []byte("must-not-deliver")), ErrConnectionNotFound)
 	require.Zero(t, delivered.Load())
+}
+
+func TestDeliverRemoteMapsStoppedActorToConnectionNotFound(t *testing.T) {
+	cases := []struct {
+		name string
+		opts []RegistryOption
+	}{
+		{name: "tell"},
+		{
+			name: "ask",
+			opts: []RegistryOption{
+				WithDeliveryConfirmation(),
+				WithConfirmationTimeout(time.Second),
+			},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			system := newRaceTestSystem(t)
+			registry := NewRegistry(system, log.DiscardLogger, tc.opts...)
+			t.Cleanup(func() { _ = registry.Close(context.Background()) })
+
+			entry := &connEntry{id: "stopped-remote-conn-" + tc.name, send: func([]byte) error { return nil }}
+			pid, err := system.Spawn(context.Background(), connActorName(entry.id), newConnActor(registry, entry.id, entry))
+			require.NoError(t, err)
+			require.NoError(t, pid.Shutdown(context.Background()))
+
+			err = registry.deliverRemote(context.Background(), pid, []byte("must-not-deliver"))
+			require.ErrorIs(t, err, ErrConnectionNotFound)
+		})
+	}
+}
+
+func TestConnectionActorUnavailable(t *testing.T) {
+	require.True(t, connectionActorUnavailable(gerrors.ErrActorNotFound))
+	require.True(t, connectionActorUnavailable(gerrors.ErrDead))
+	require.False(t, connectionActorUnavailable(errors.New("unrelated actor error")))
 }

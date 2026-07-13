@@ -56,6 +56,12 @@ jobs:
       - name: govulncheck
         run: go run golang.org/x/vuln/cmd/govulncheck@v1.6.0 ./...
 
+      - name: Stress connection lifecycle regressions
+        run: >-
+          go test -race -shuffle=on -count=20
+          -run 'Test(RegisterUnregisterTOCTOU(_ConcurrentRegisterGetsAlreadyRegistered)?|RegisterRollbackDoesNotClobberTakeover|OwnerLeaseAdvanceGenerationFailureRollsBackRegistration|DeliverRemoteMapsStoppedActorToConnectionNotFound)'
+          .
+
       - name: Test with coverage
         run: |
           go test -race -count=1 -covermode=atomic -coverprofile=coverage.out ./...

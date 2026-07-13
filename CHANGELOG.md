@@ -372,6 +372,14 @@ of it sees identical behavior to before.
   `CASCoordinator` and `LinearizableFencingCoordinator` (`coordinator.go`), `GenerationalHistory` (`sse_history.go`),
   `OutboxGenerationAdvancer` (`persistence.go`), and `PresenceFencer` (`presence.go`).
 
+### Fixed
+
+- **Connection actor shutdown race** - `SendToConnection` and `Disconnect` now report
+  `ErrConnectionNotFound` when a connection actor has already started shutdown but its PID is
+  still briefly resolvable. Takeover, confirmed delivery, and group disconnect paths treat the
+  same stale PID as unavailable instead of surfacing `actor is not alive` or logging a false
+  failure.
+
 ### Changed
 
 - `coordinator/redis.New` now takes a `redis.UniversalClient` instead of a
