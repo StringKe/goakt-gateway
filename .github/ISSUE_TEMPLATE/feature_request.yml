@@ -1,0 +1,51 @@
+name: Feature request
+description: Propose a concrete, maintainable capability for goakt-gateway.
+title: "[Feature]: "
+labels:
+  - enhancement
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Feature requests must describe a production use case, public API impact, and operational trade-offs.
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: Describe the concrete use case and the current limitation.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed API or behavior
+      description: Show the expected Go API and describe multi-instance, delivery, or lifecycle effects where relevant.
+      render: go
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Explain why configuration, composition, or an application-level implementation is insufficient.
+    validations:
+      required: true
+  - type: dropdown
+    id: compatibility
+    attributes:
+      label: Compatibility impact
+      options:
+        - Backward compatible
+        - Breaking public API change
+        - Unknown
+    validations:
+      required: true
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Checks
+      options:
+        - label: I searched existing issues before opening this request.
+          required: true
+        - label: I can help test the proposed behavior in a real deployment.
+          required: false

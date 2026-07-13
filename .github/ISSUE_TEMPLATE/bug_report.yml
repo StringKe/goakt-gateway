@@ -1,0 +1,69 @@
+name: Bug report
+description: Report a reproducible defect in goakt-gateway.
+title: "[Bug]: "
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Provide a minimal reproducer and remove credentials, tokens, certificates, and private endpoints.
+  - type: input
+    id: version
+    attributes:
+      label: goakt-gateway version
+      description: Include the module version or commit SHA.
+      placeholder: v0.1.0
+    validations:
+      required: true
+  - type: input
+    id: go-version
+    attributes:
+      label: Go version
+      placeholder: go version go1.26.5 darwin/arm64
+    validations:
+      required: true
+  - type: dropdown
+    id: component
+    attributes:
+      label: Affected component
+      options:
+        - Registry and delivery
+        - WebSocket
+        - SSE
+        - TLS and certificates
+        - Presence or OwnerLease
+        - Redis or Valkey backend
+        - Other
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Minimal reproduction
+      description: Include the smallest complete program, configuration, and commands that reproduce the defect.
+      render: shell
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior and sanitized logs
+      description: Include the full error and stack trace after removing sensitive values.
+    validations:
+      required: true
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Checks
+      options:
+        - label: I searched existing issues before opening this report.
+          required: true
+        - label: I removed secrets and private customer data.
+          required: true
