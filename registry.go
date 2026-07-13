@@ -897,12 +897,16 @@ func (r *Registry) doSpawn(ctx context.Context, id string, entry *connEntry) (*a
 func (r *Registry) requestRemoteEvict(ctx context.Context, id string) error {
 	pid, err := r.system.ActorOf(ctx, connActorName(id))
 	if err != nil {
-		if errors.Is(err, gerrors.ErrActorNotFound) {
+		if connectionActorUnavailable(err) {
 			return nil
 		}
 		return err
 	}
-	return r.system.NoSender().Tell(ctx, pid, wrapperspb.String(evictReasonPrefix+takeoverEvictReason))
+	err = r.system.NoSender().Tell(ctx, pid, wrapperspb.String(evictReasonPrefix+takeoverEvictReason))
+	if connectionActorUnavailable(err) {
+		return nil
+	}
+	return err
 }
 
 // evictLocal force-closes and fully unregisters the specific connection generation entry
@@ -1445,7 +1449,7 @@ func (r *Registry) SendToConnection(ctx context.Context, id string, payload []by
 
 	pid, err := r.system.ActorOf(ctx, connActorName(id))
 	if err != nil {
-		if errors.Is(err, gerrors.ErrActorNotFound) {
+		if connectionActorUnavailable(err) {
 			return ErrConnectionNotFound
 		}
 		return err
@@ -1467,16 +1471,30 @@ func (r *Registry) outboxWirePayload(msgID string, seq uint64, payload []byte) (
 // ErrConnectionClosed when the remote node reports the socket write itself failed.
 func (r *Registry) deliverRemote(ctx context.Context, pid *actor.PID, payload []byte) error {
 	if !r.confirmDelivery {
-		return r.system.NoSender().Tell(ctx, pid, wrapperspb.Bytes(payload))
+		err := r.system.NoSender().Tell(ctx, pid, wrapperspb.Bytes(payload))
+		if connectionActorUnavailable(err) {
+			return ErrConnectionNotFound
+		}
+		return err
 	}
 	ok, err := r.askRemote(ctx, pid, payload)
 	if err != nil {
+		if connectionActorUnavailable(err) {
+			return ErrConnectionNotFound
+		}
 		return err
 	}
 	if !ok {
 		return ErrConnectionClosed
 	}
 	return nil
+}
+
+// connectionActorUnavailable normalizes a directory miss and a stale PID that has already
+// started shutdown. Both mean the connection is no longer reachable, even though the actor
+// directory can expose the stale PID briefly while its termination propagates.
+func connectionActorUnavailable(err error) bool {
+	return errors.Is(err, gerrors.ErrActorNotFound) || errors.Is(err, gerrors.ErrDead)
 }
 
 // askRemote sends payload to a remote connActor and waits for its ack under the confirmation
@@ -1609,14 +1627,16 @@ func (r *Registry) confirmRemoteGroup(ctx context.Context, group string, payload
 
 			pid, err := r.system.ActorOf(ctx, connActorName(id))
 			if err != nil {
-				if !errors.Is(err, gerrors.ErrActorNotFound) {
+				if !connectionActorUnavailable(err) {
 					r.logger.Warnf("gateway: failed to resolve remote group member %q for confirmed delivery: %v", id, err)
 				}
 				return
 			}
 			ok, err := r.askRemote(ctx, pid, payload)
 			if err != nil {
-				r.logger.Warnf("gateway: confirmed delivery to remote group member %q failed: %v", id, err)
+				if !connectionActorUnavailable(err) {
+					r.logger.Warnf("gateway: confirmed delivery to remote group member %q failed: %v", id, err)
+				}
 				return
 			}
 			if ok {
@@ -1742,12 +1762,16 @@ func (r *Registry) Disconnect(ctx context.Context, id, reason string) error {
 
 	pid, err := r.system.ActorOf(ctx, connActorName(id))
 	if err != nil {
-		if errors.Is(err, gerrors.ErrActorNotFound) {
+		if connectionActorUnavailable(err) {
 			return ErrConnectionNotFound
 		}
 		return err
 	}
-	return r.system.NoSender().Tell(ctx, pid, wrapperspb.String(reason))
+	err = r.system.NoSender().Tell(ctx, pid, wrapperspb.String(reason))
+	if connectionActorUnavailable(err) {
+		return ErrConnectionNotFound
+	}
+	return err
 }
 
 // DisconnectGroup force-closes every connection of an identity group across the cluster,
@@ -1794,13 +1818,15 @@ func (r *Registry) DisconnectGroup(ctx context.Context, group, reason string) (i
 		}
 		pid, err := r.system.ActorOf(ctx, connActorName(id))
 		if err != nil {
-			if !errors.Is(err, gerrors.ErrActorNotFound) {
+			if !connectionActorUnavailable(err) {
 				r.logger.Warnf("gateway: failed to resolve remote group member %q for disconnect: %v", id, err)
 			}
 			continue
 		}
 		if err := r.system.NoSender().Tell(ctx, pid, wrapperspb.String(reason)); err != nil {
-			r.logger.Warnf("gateway: failed to signal disconnect to remote group member %q: %v", id, err)
+			if !connectionActorUnavailable(err) {
+				r.logger.Warnf("gateway: failed to signal disconnect to remote group member %q: %v", id, err)
+			}
 			continue
 		}
 		closed++
