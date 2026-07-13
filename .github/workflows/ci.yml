@@ -6,14 +6,28 @@ on:
   pull_request:
 
 jobs:
-  test:
+  # No Redis/Valkey service: exercises build, static checks, and the pure-Go tests.
+  # The four RESP conformance suites self-skip without TEST_REDIS_ADDR, so this job
+  # deliberately does not cover them - the integration job below does.
+  build:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
+      # go-version-file keeps the toolchain pinned to the `go` directive in go.mod,
+      # so CI can never drift from the version the module declares.
       - uses: actions/setup-go@v5
         with:
-          go-version: "1.26.4"
+          go-version-file: go.mod
+
+      - name: gofmt
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "gofmt needed on:"
+            echo "$unformatted"
+            exit 1
+          fi
 
       - name: Build
         run: go build ./...
@@ -22,4 +36,46 @@ jobs:
         run: go vet ./...
 
       - name: Test
+        run: go test -race -count=1 ./...
+
+  # Redis and Valkey run side by side on different host ports (mirroring
+  # docker-compose.yml), so the RESP conformance suites run once against each. Without
+  # this job the redis-backed packages would silently SKIP and the interchangeability
+  # claim would go unverified.
+  integration:
+    runs-on: ubuntu-latest
+    services:
+      redis:
+        image: redis:7
+        ports:
+          - 6399:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+      valkey:
+        image: valkey/valkey:8
+        ports:
+          - 6400:6379
+        options: >-
+          --health-cmd "valkey-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Test against Redis
+        env:
+          TEST_REDIS_ADDR: 127.0.0.1:6399
+        run: go test -race -count=1 ./...
+
+      - name: Test against Valkey
+        env:
+          TEST_REDIS_ADDR: 127.0.0.1:6400
         run: go test -race -count=1 ./...

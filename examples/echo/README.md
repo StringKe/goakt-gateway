@@ -19,10 +19,36 @@ This starts an HTTP server on `http://127.0.0.1:8080` with two endpoints:
   `msg` to the WebSocket connection registered under `id`, via
   `Registry.SendToConnection`.
 
+## Default behavior worth knowing before you connect
+
+`NewWSHandler` ships opinionated defaults; this sample changes none of them, so what you
+see below is the library's out-of-the-box behavior, not something main.go configured:
+
+- **Text frames only.** `WithWSOnMessage` fires for `websocket.MessageText` frames
+  (`WithWSMessageType` default). A client sending binary frames is rejected by the
+  underlying `coder/websocket` library before your handler ever sees it.
+- **Origin check: same-Host only.** A browser always sends an `Origin` header, and the
+  default policy (no `WithWSOriginPatterns`) accepts it only when it matches the
+  request's own `Host`. Non-browser clients (`websocat`, `curl`, `wscat`, this sample's
+  browser console snippet run from `file://` or a different port) send no `Origin`
+  header at all and are exempt from the check - see `authorizeOrigin` in `ws.go`. Cross-
+  origin browser pages need `WithWSOriginPatterns` or `WithWSInsecureSkipOriginCheck`,
+  neither of which this sample sets.
+- **Ping/pong keepalive.** Every 30s (`WithWSPingInterval` default) the handler pings the
+  socket and expects a pong within 10s, so a half-open connection (client vanished
+  without a close frame - the common case on mobile networks) is dropped instead of
+  leaking forever. You won't observe this on a short-lived local test; it matters once
+  connections live for minutes.
+- **Takeover on reconnect.** Registering the same `id` twice does not fail: the new
+  connection replaces the old one (`WithWSReplaceExisting`, on by default) and the old
+  socket is closed. Reconnect with `?id=alice` while a previous `alice` connection is
+  still open to see the first one close.
+
 ## Try it
 
-In one terminal, connect a WebSocket client (any client works; here's one using
-`websocat`, or use your browser's devtools console):
+In one terminal, connect a WebSocket client. Any client works - `websocat` is used here
+because it is a single static binary; `wscat` (`npx wscat -c ...`) is an equivalent
+Node-based alternative:
 
 ```
 websocat ws://127.0.0.1:8080/ws?id=alice
@@ -41,13 +67,24 @@ The text appears in the WebSocket client. That single `curl` call is
 this same process, the payload is written directly to the socket - no actor mailbox, no
 cluster lookup.
 
-Browser console alternative (no extra tools required):
+Browser console alternative (no extra tools required - open any page served from
+`http://127.0.0.1:8080`, or any other origin since this sample sets no origin
+restriction and non-browser-style requests are exempt; a page's own `fetch`/`WebSocket`
+calls do carry `Origin`, so if you instead open the console on a page served from a
+*different* origin than `127.0.0.1:8080`, the upgrade is rejected with HTTP 403 unless
+you widen `WithWSOriginPatterns`):
 
 ```js
 const ws = new WebSocket("ws://127.0.0.1:8080/ws?id=alice");
 ws.onmessage = (e) => console.log("received:", e.data);
 ws.onopen = () => ws.send("ping");
 ```
+
+**Success looks like:** the terminal running `go run ./examples/echo` logs
+`connection "alice" joined`; typing in the WebSocket client echoes the same text back;
+the `curl /send` command's message appears in the WebSocket client without you typing
+anything; closing the client (or reconnecting with the same `id`) logs
+`connection "alice" left`.
 
 ## What this sample does not show: cross-instance delivery
 

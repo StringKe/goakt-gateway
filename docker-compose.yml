@@ -1,0 +1,24 @@
+# Two interchangeable RESP servers for running the Redis/Valkey conformance suites.
+# go-redis speaks the same protocol to both, so the four backend packages
+# (coordinator, presence, store, ssehistory) run identically against either one; the
+# point of shipping both here is to make that interchangeability one command away.
+#
+#   docker compose up -d
+#   TEST_REDIS_ADDR=127.0.0.1:6399 go test ./... -race -count=1   # against Redis
+#   TEST_REDIS_ADDR=127.0.0.1:6400 go test ./... -race -count=1   # against Valkey
+#   docker compose down
+#
+# The two services listen on different host ports so both can run at once; point
+# TEST_REDIS_ADDR at whichever you want a given test run to exercise.
+services:
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6399:6379"
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+
+  valkey:
+    image: valkey/valkey:8-alpine
+    ports:
+      - "6400:6379"
+    command: ["valkey-server", "--save", "", "--appendonly", "no"]

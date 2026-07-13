@@ -64,20 +64,25 @@ func main() {
 	mux := http.NewServeMux()
 
 	mux.Handle("/ws", gateway.NewWSHandler(registry,
-		gateway.WithWSIDFunc(func(r *http.Request) string { return r.URL.Query().Get("id") }),
-		gateway.WithWSOnMessage(func(ctx context.Context, id string, payload []byte) {
+		// WithWSAuth is the primary identity hook in the current API: it resolves the full
+		// ConnInfo (id, group, topics, meta) from the upgrade request in one pass, instead of
+		// the old id/topics-only callbacks that parsed the same query string three times.
+		gateway.WithWSAuth(func(r *http.Request) (*gateway.ConnInfo, error) {
+			return &gateway.ConnInfo{ID: r.URL.Query().Get("id")}, nil
+		}),
+		gateway.WithWSOnMessage(func(ctx context.Context, info *gateway.ConnInfo, payload []byte) {
 			// Echo whatever the client sends straight back to it. Because this
 			// connection is always local to this process, SendToConnection takes the
 			// direct-write fast path with no actor/cluster involvement.
-			if err := registry.SendToConnection(ctx, id, payload); err != nil {
-				log.Printf("echo to %q failed: %v", id, err)
+			if err := registry.SendToConnection(ctx, info.ID, payload); err != nil {
+				log.Printf("echo to %q failed: %v", info.ID, err)
 			}
 		}),
-		gateway.WithWSOnConnect(func(_ context.Context, id string, _ *http.Request) {
-			log.Printf("connection %q joined", id)
+		gateway.WithWSOnConnect(func(_ context.Context, info *gateway.ConnInfo, _ *http.Request) {
+			log.Printf("connection %q joined", info.ID)
 		}),
-		gateway.WithWSOnDisconnect(func(id string) {
-			log.Printf("connection %q left", id)
+		gateway.WithWSOnDisconnect(func(info *gateway.ConnInfo) {
+			log.Printf("connection %q left", info.ID)
 		}),
 	))
 
