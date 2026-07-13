@@ -11,13 +11,17 @@ package exists for.
 go run ./examples/echo
 ```
 
-This starts an HTTP server on `http://127.0.0.1:8080` with two endpoints:
+This starts an HTTP server on `http://127.0.0.1:8080` with three endpoints:
 
 - `GET /ws?id=<connection-id>` - upgrades to a WebSocket connection and echoes back
   whatever the client sends.
 - `GET /send?id=<connection-id>&msg=<text>` - an ordinary HTTP handler that delivers
   `msg` to the WebSocket connection registered under `id`, via
   `Registry.SendToConnection`.
+- `GET /healthz` - returns HTTP 204 for Kubernetes liveness and readiness probes.
+
+The process accepts `SIGINT` and `SIGTERM`. Shutdown uses a 30 second deadline and
+drains the WebSocket handler through `Server.Shutdown` before the process exits.
 
 ## Default behavior worth knowing before you connect
 
