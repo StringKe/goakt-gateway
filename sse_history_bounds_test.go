@@ -23,20 +23,33 @@
 package gateway_test
 
 import (
+	"context"
 	"testing"
 
+	"github.com/stretchr/testify/require"
+
 	gateway "github.com/StringKe/goakt-gateway"
-	"github.com/StringKe/goakt-gateway/coordinator/conformance"
 )
 
-func TestMemoryCoordinatorConformance(t *testing.T) {
-	conformance.Run(t, func(*testing.T) gateway.Coordinator {
-		return gateway.NewMemoryCoordinator()
-	})
-}
+// TestMemorySSEHistorySinceReturnsIndependentCopy guards the snapshot ownership rule on the
+// read side: Since must hand back a fully independent copy, so a caller mutating a replayed
+// payload cannot corrupt the retained buffer that a later Since (or a concurrent reader) reads.
+func TestMemorySSEHistorySinceReturnsIndependentCopy(t *testing.T) {
+	ctx := context.Background()
+	history := gateway.NewMemorySSEHistory(10)
 
-func TestMemoryCoordinatorCASConformance(t *testing.T) {
-	conformance.RunCAS(t, func(*testing.T) gateway.CASCoordinator {
-		return gateway.NewMemoryCoordinator()
-	})
+	require.NoError(t, history.Append(ctx, "c1", "c1-1", []byte("original")))
+
+	events, err := history.Since(ctx, "c1", "")
+	require.NoError(t, err)
+	require.Len(t, events, 1)
+
+	// A caller that owns the returned events mutates the payload in place.
+	copy(events[0].Payload, []byte("mangled!"))
+
+	// The retained buffer must be untouched by that mutation.
+	again, err := history.Since(ctx, "c1", "")
+	require.NoError(t, err)
+	require.Len(t, again, 1)
+	require.Equal(t, []byte("original"), again[0].Payload)
 }

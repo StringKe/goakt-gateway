@@ -30,8 +30,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/coder/websocket"
 	"github.com/stretchr/testify/require"
-	"golang.org/x/net/websocket"
 
 	"github.com/tochemey/goakt/v4/log"
 
@@ -76,20 +76,16 @@ func TestNewServerWithTLSManagerAndOriginPulls(t *testing.T) {
 	require.NotNil(t, srv)
 }
 
-// TestServerListenAndServeTLSShutdown verifies Shutdown's actual, documented scope: it
-// stops accepting new connections and returns http.ErrServerClosed from ListenAndServe,
-// and any new connection attempt after that point is rejected.
+// TestServerListenAndServeTLSShutdown verifies Shutdown's scope: it stops accepting new
+// connections, returns http.ErrServerClosed from ListenAndServe, rejects any subsequent
+// connection attempt, and evicts already-established WebSocket connections through the
+// drainer registered with WithDrainOnShutdown.
 //
-// It deliberately does NOT assert that an already-established WebSocket connection gets
-// closed by Shutdown: golang.org/x/net/websocket accepts the connection via
-// http.Hijacker, and the standard library documents that "Shutdown does not attempt to
-// close nor wait for hijacked connections such as WebSockets" - confirmed against this
-// exact handler by a standalone experiment before writing this test. gateway's
-// ws.go/sse.go handlers also never select on the request context in their blocking read
-// loops, so nothing in this package would notice a Shutdown-driven cancellation even if
-// the stdlib did propagate one. Draining already-open connections on Shutdown is not
-// implemented; this test documents the real behavior instead of asserting a guarantee
-// the code does not provide.
+// The eviction is entirely the drainer's doing, not the standard library's: a WebSocket
+// is served over a hijacked connection, and net/http documents that "Shutdown does not
+// attempt to close nor wait for hijacked connections such as WebSockets". Without
+// WithDrainOnShutdown the established connection below would survive Shutdown and hang
+// until the peer went away, which is exactly why WSHandler.Drain exists.
 func TestServerListenAndServeTLSShutdown(t *testing.T) {
 	system := newTestSystem(t)
 	registry := gateway.NewRegistry(system, log.DiscardLogger)
@@ -127,18 +123,23 @@ func TestServerListenAndServeTLSShutdown(t *testing.T) {
 	go func() { serveErrCh <- srv.ListenAndServe(context.Background()) }()
 	time.Sleep(300 * time.Millisecond)
 
+	client := &http.Client{
+		Transport: &http.Transport{
+			TLSClientConfig: &tls.Config{InsecureSkipVerify: true, ServerName: domain}, //nolint:gosec // test-only self-signed cert
+		},
+	}
 	dial := func() (*websocket.Conn, error) {
-		cfg, cfgErr := websocket.NewConfig(fmt.Sprintf("wss://%s/?id=drain-1", dialAddr), fmt.Sprintf("https://%s", dialAddr))
-		if cfgErr != nil {
-			return nil, cfgErr
-		}
-		cfg.TlsConfig = &tls.Config{InsecureSkipVerify: true, ServerName: domain} //nolint:gosec // test-only self-signed cert
-		return websocket.DialConfig(cfg)
+		dialCtx, dialCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer dialCancel()
+		conn, _, dialErr := websocket.Dial(dialCtx, fmt.Sprintf("wss://%s/?id=drain-1", dialAddr), &websocket.DialOptions{
+			HTTPClient: client,
+		})
+		return conn, dialErr
 	}
 
 	ws, err := dial()
 	require.NoError(t, err)
-	defer func() { _ = ws.Close() }()
+	defer func() { _ = ws.CloseNow() }()
 
 	time.Sleep(200 * time.Millisecond)
 	require.True(t, registry.Has("drain-1"))
@@ -156,8 +157,10 @@ func TestServerListenAndServeTLSShutdown(t *testing.T) {
 
 	// the drained handler must have evicted the established connection: the client's
 	// blocked read unblocks with an error instead of hanging until the peer goes away.
-	var payload []byte
-	require.Error(t, websocket.Message.Receive(ws, &payload))
+	readCtx, readCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer readCancel()
+	_, _, err = ws.Read(readCtx)
+	require.Error(t, err)
 
 	// eviction runs the normal disconnect path, so the registry entry disappears.
 	require.Eventually(t, func() bool {

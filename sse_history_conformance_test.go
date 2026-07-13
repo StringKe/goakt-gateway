@@ -26,17 +26,14 @@ import (
 	"testing"
 
 	gateway "github.com/StringKe/goakt-gateway"
-	"github.com/StringKe/goakt-gateway/coordinator/conformance"
+	"github.com/StringKe/goakt-gateway/ssehistory/conformance"
 )
 
-func TestMemoryCoordinatorConformance(t *testing.T) {
-	conformance.Run(t, func(*testing.T) gateway.Coordinator {
-		return gateway.NewMemoryCoordinator()
-	})
-}
-
-func TestMemoryCoordinatorCASConformance(t *testing.T) {
-	conformance.RunCAS(t, func(*testing.T) gateway.CASCoordinator {
-		return gateway.NewMemoryCoordinator()
+// TestMemorySSEHistoryConformance holds gateway.MemorySSEHistory to the same Last-Event-ID
+// contract the Redis backend is held to, so the two cannot drift apart. perConn is set well
+// above the suite's 8-event ceiling, as the suite's factory contract requires.
+func TestMemorySSEHistoryConformance(t *testing.T) {
+	conformance.Run(t, func() gateway.SSEHistory {
+		return gateway.NewMemorySSEHistory(32)
 	})
 }

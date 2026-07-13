@@ -25,6 +25,7 @@ package gateway
 import (
 	"context"
 	"fmt"
+	stdlog "log"
 	"net/http"
 	"time"
 )
@@ -80,6 +81,18 @@ func WithDrainOnShutdown(drainers ...Drainer) ServerOption {
 // WithReadHeaderTimeout sets the underlying http.Server's ReadHeaderTimeout.
 func WithReadHeaderTimeout(d time.Duration) ServerOption {
 	return func(s *Server) { s.httpServer.ReadHeaderTimeout = d }
+}
+
+// WithServerErrorLog sets the underlying http.Server's ErrorLog.
+//
+// A TLS listener logs every failed handshake, so load balancer and Kubernetes readiness
+// probes that connect and disconnect without completing one produce a steady stream of
+// "http: TLS handshake error ...: EOF" lines on stderr. Routing them to a logger the
+// application controls is the only way to filter or silence that noise. To drop them
+// entirely, pass stdlog.New(io.Discard, "", 0); leaving this option unset keeps net/http's
+// default of writing to the standard logger.
+func WithServerErrorLog(logger *stdlog.Logger) ServerOption {
+	return func(s *Server) { s.httpServer.ErrorLog = logger }
 }
 
 // NewServer creates a Server listening on addr and dispatching to handler.

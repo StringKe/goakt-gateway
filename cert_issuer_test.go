@@ -159,7 +159,7 @@ func TestCloudflareOriginCAIssuerMalformedJSON(t *testing.T) {
 // TestCloudflareOriginCAIssuerMissingCertificate verifies that a success:true response
 // with no certificate field still yields a Certificate (Cloudflare's contract - Issue does
 // not itself validate the certificate is non-empty; that is caught downstream by
-// Manager.issue's parseCertificate) rather than panicking on a nil/missing field.
+// Manager.issue's parseAndVerify) rather than panicking on a nil/missing field.
 func TestCloudflareOriginCAIssuerMissingCertificate(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)
@@ -209,7 +209,7 @@ type cloudflareOriginCAResponseMirror struct {
 
 // TestStaticIssuer covers StaticIssuer's actual surface: it serves a fixed certificate for
 // exactly the domains it was configured with, and performs no validation of its own - a
-// mismatched cert/key pair is only caught downstream, by Manager.issue's parseCertificate.
+// mismatched cert/key pair is only caught downstream, by Manager.issue's parseAndVerify.
 func TestStaticIssuer(t *testing.T) {
 	certPEM, keyPEM := generateTestCertificate("a.example.com", time.Now().Add(time.Hour))
 	cert := &gateway.Certificate{CertPEM: certPEM, KeyPEM: keyPEM, NotAfter: time.Now().Add(time.Hour)}
@@ -239,6 +239,7 @@ func TestStaticIssuer(t *testing.T) {
 		system := newTestSystem(t)
 		manager := gateway.NewManager(system, log.DiscardLogger,
 			gateway.WithCertIssuer(badIssuer),
+			gateway.WithAllowedDomains("mismatch.example.com"),
 			gateway.WithRenewInterval(""),
 		)
 		_, err := manager.EnsureCertificate(context.Background(), "mismatch.example.com")

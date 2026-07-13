@@ -102,11 +102,15 @@ func TestRegistryBroadcastLocalMembersOnly(t *testing.T) {
 		}
 	}
 
-	require.NoError(t, registry.Register(ctx, "a", makeSend("a"), "room-1"))
-	require.NoError(t, registry.Register(ctx, "b", makeSend("b"), "room-1"))
+	require.NoError(t, registry.Register(ctx, "a", makeSend("a"), gateway.WithConnTopics("room-1")))
+	require.NoError(t, registry.Register(ctx, "b", makeSend("b"), gateway.WithConnTopics("room-1")))
 	require.NoError(t, registry.Register(ctx, "c", makeSend("c")))
 
-	require.NoError(t, registry.Broadcast(ctx, "room-1", []byte("hi")))
+	result, err := registry.Broadcast(ctx, "room-1", []byte("hi"))
+	require.NoError(t, err)
+	require.Equal(t, 2, result.Delivered)
+	require.Equal(t, 0, result.Dropped)
+	require.Equal(t, 0, result.Remote)
 
 	time.Sleep(300 * time.Millisecond)
 
@@ -134,11 +138,13 @@ func TestRegistryJoinLeave(t *testing.T) {
 	require.NoError(t, registry.Register(ctx, "leaver", send))
 	require.NoError(t, registry.Join(ctx, "leaver", "topic-x"))
 
-	require.NoError(t, registry.Broadcast(ctx, "topic-x", []byte("one")))
+	_, err := registry.Broadcast(ctx, "topic-x", []byte("one"))
+	require.NoError(t, err)
 	time.Sleep(200 * time.Millisecond)
 
 	require.NoError(t, registry.Leave(ctx, "leaver", "topic-x"))
-	require.NoError(t, registry.Broadcast(ctx, "topic-x", []byte("two")))
+	_, err = registry.Broadcast(ctx, "topic-x", []byte("two"))
+	require.NoError(t, err)
 	time.Sleep(200 * time.Millisecond)
 
 	mu.Lock()
@@ -203,7 +209,8 @@ func TestRegistryBroadcastZeroMembers(t *testing.T) {
 	registry := gateway.NewRegistry(system, log.DiscardLogger)
 
 	require.NotPanics(t, func() {
-		err := registry.Broadcast(context.Background(), "nobody-home", []byte("hello"))
+		result, err := registry.Broadcast(context.Background(), "nobody-home", []byte("hello"))
 		require.NoError(t, err)
+		require.True(t, result.None())
 	})
 }

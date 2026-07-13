@@ -25,18 +25,26 @@ package gateway_test
 import (
 	"testing"
 
+	"github.com/stretchr/testify/require"
+
 	gateway "github.com/StringKe/goakt-gateway"
-	"github.com/StringKe/goakt-gateway/coordinator/conformance"
+	"github.com/StringKe/goakt-gateway/store/conformance"
 )
 
-func TestMemoryCoordinatorConformance(t *testing.T) {
-	conformance.Run(t, func(*testing.T) gateway.Coordinator {
-		return gateway.NewMemoryCoordinator()
+// TestMemoryCertStoreConformance holds gateway.MemoryCertStore to the same contract the
+// Redis backend is held to, so the two cannot drift apart.
+func TestMemoryCertStoreConformance(t *testing.T) {
+	conformance.Run(t, func() gateway.CertStore {
+		return gateway.NewMemoryCertStore()
 	})
 }
 
-func TestMemoryCoordinatorCASConformance(t *testing.T) {
-	conformance.RunCAS(t, func(*testing.T) gateway.CASCoordinator {
-		return gateway.NewMemoryCoordinator()
+// TestFileCertStoreConformance holds gateway.FileCertStore to the same contract. Each
+// factory call gets its own temp directory so subtests never share on-disk state.
+func TestFileCertStoreConformance(t *testing.T) {
+	conformance.Run(t, func() gateway.CertStore {
+		store, err := gateway.NewFileCertStore(t.TempDir())
+		require.NoError(t, err)
+		return store
 	})
 }

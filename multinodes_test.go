@@ -77,6 +77,7 @@ func TestGatewayMultiNodesCertIssuance(t *testing.T) {
 		managers[i] = gateway.NewManager(node.ActorSystem(), log.DiscardLogger,
 			gateway.WithCertIssuer(issuer),
 			gateway.WithCoordinator(coordinator),
+			gateway.WithAllowedDomains("cluster-cold-start.example.com"),
 			gateway.WithRenewInterval(""),
 			gateway.WithRenewBefore(time.Minute),
 			gateway.WithIssuanceLockTTL(10*time.Second),
@@ -180,11 +181,12 @@ func TestGatewayMultiNodesBroadcast(t *testing.T) {
 		return nil
 	}
 
-	require.NoError(t, registryA.Register(ctx, "bridge-member", send, "cross-node-room"))
+	require.NoError(t, registryA.Register(ctx, "bridge-member", send, gateway.WithConnTopics("cross-node-room")))
 	// give the topic actor's cluster dissemination time to establish before publishing.
 	time.Sleep(2 * time.Second)
 
-	require.NoError(t, registryB.Broadcast(ctx, "cross-node-room", []byte("hello-from-node-b")))
+	_, err := registryB.Broadcast(ctx, "cross-node-room", []byte("hello-from-node-b"))
+	require.NoError(t, err)
 
 	require.Eventually(t, func() bool {
 		mu.Lock()
@@ -195,4 +197,155 @@ func TestGatewayMultiNodesBroadcast(t *testing.T) {
 	mu.Lock()
 	defer mu.Unlock()
 	require.Equal(t, []byte("hello-from-node-b"), received[0])
+}
+
+// TestGatewayMultiNodesConfirmedDelivery verifies that with WithDeliveryConfirmation a
+// cross-node SendToConnection uses Ask and returns only after the owning node acknowledges
+// the write, rather than the default fire-and-forget Tell.
+func TestGatewayMultiNodesConfirmedDelivery(t *testing.T) {
+	ctx := context.Background()
+
+	multi := testkit.NewMultiNodes(t, log.DiscardLogger, []actor.Actor{&clusterKindActor{}}, nil)
+	multi.Start()
+	t.Cleanup(multi.Stop)
+
+	nodeA := multi.StartNode(ctx, "confirm-node-a")
+	nodeB := multi.StartNode(ctx, "confirm-node-b")
+
+	registryA := gateway.NewRegistry(nodeA.ActorSystem(), log.DiscardLogger)
+	registryB := gateway.NewRegistry(nodeB.ActorSystem(), log.DiscardLogger,
+		gateway.WithDeliveryConfirmation(),
+		gateway.WithConfirmationTimeout(3*time.Second),
+	)
+
+	var mu sync.Mutex
+	var received []byte
+	send := func(payload []byte) error {
+		mu.Lock()
+		defer mu.Unlock()
+		received = payload
+		return nil
+	}
+
+	require.NoError(t, registryA.Register(ctx, "confirmed-conn", send))
+	time.Sleep(2 * time.Second)
+	require.False(t, registryB.Has("confirmed-conn"))
+
+	require.NoError(t, registryB.SendToConnection(ctx, "confirmed-conn", []byte("confirmed-hello")))
+
+	// The Ask returned success, so the payload is already delivered without further waiting.
+	mu.Lock()
+	require.Equal(t, []byte("confirmed-hello"), received)
+	mu.Unlock()
+}
+
+// TestGatewayMultiNodesCrossNodeTakeover proves the deterministic reconnect takeover works
+// across nodes, which the pre-fix reserve could not do: it only evicted a same-node holder,
+// so a takeover landing on a different node hit the cluster-unique connActor name and failed
+// its Spawn with ErrActorAlreadyExists. A connection is held on node A; the same id reconnects
+// to node B with WithReplaceExisting. Node B must evict A's connection - closing its socket
+// and releasing the name - and end up owning the connection, with A holding nothing.
+func TestGatewayMultiNodesCrossNodeTakeover(t *testing.T) {
+	ctx := context.Background()
+
+	multi := testkit.NewMultiNodes(t, log.DiscardLogger, []actor.Actor{&clusterKindActor{}}, nil)
+	multi.Start()
+	t.Cleanup(multi.Stop)
+
+	nodeA := multi.StartNode(ctx, "takeover-node-a")
+	nodeB := multi.StartNode(ctx, "takeover-node-b")
+
+	registryA := gateway.NewRegistry(nodeA.ActorSystem(), log.DiscardLogger)
+	registryB := gateway.NewRegistry(nodeB.ActorSystem(), log.DiscardLogger)
+	t.Cleanup(func() { _ = registryA.Close(ctx); _ = registryB.Close(ctx) })
+
+	var mu sync.Mutex
+	evicted := ""
+	var oldReceived [][]byte
+	oldSend := func(payload []byte) error {
+		mu.Lock()
+		defer mu.Unlock()
+		oldReceived = append(oldReceived, payload)
+		return nil
+	}
+	closeHook := func(reason string) {
+		mu.Lock()
+		defer mu.Unlock()
+		evicted = reason
+	}
+
+	require.NoError(t, registryA.Register(ctx, "roamer", oldSend, gateway.WithConnCloseHook(closeHook)))
+	// let the cluster directory propagate node A's ownership of the actor name to node B.
+	time.Sleep(2 * time.Second)
+
+	var newReceived [][]byte
+	newSend := func(payload []byte) error {
+		mu.Lock()
+		defer mu.Unlock()
+		newReceived = append(newReceived, payload)
+		return nil
+	}
+	require.NoError(t, registryB.Register(ctx, "roamer", newSend, gateway.WithReplaceExisting()),
+		"the cross-node takeover must succeed once node A's connection is evicted")
+
+	require.True(t, registryB.Has("roamer"), "node B must now own the connection")
+
+	// Node A's previous connection must have been force-closed by the takeover and released.
+	mu.Lock()
+	require.NotEmpty(t, evicted, "node A's old connection must have been force-closed by the takeover")
+	mu.Unlock()
+	require.Eventually(t, func() bool {
+		return !registryA.Has("roamer")
+	}, 5*time.Second, 100*time.Millisecond, "node A must release the connection after eviction")
+
+	// A delivery addressed from node A now resolves to node B and reaches the new socket.
+	require.Eventually(t, func() bool {
+		return registryA.SendToConnection(ctx, "roamer", []byte("after-takeover")) == nil
+	}, 5*time.Second, 200*time.Millisecond, "node A must be able to route to the new owner on node B")
+
+	require.Eventually(t, func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+		return len(newReceived) == 1 && string(newReceived[0]) == "after-takeover"
+	}, 5*time.Second, 100*time.Millisecond, "the new owner on node B must receive deliveries")
+
+	mu.Lock()
+	require.Empty(t, oldReceived, "the evicted connection must receive nothing after takeover")
+	mu.Unlock()
+}
+
+// TestGatewayMultiNodesConfirmedGroupRemoteCount verifies that with a shared Presence
+// backend and WithDeliveryConfirmation, SendToGroup issued from a node holding none of a
+// group's members sets DeliveryResult.Remote to the number of remote members whose owning
+// node acknowledged the write, rather than a single fan-out.
+func TestGatewayMultiNodesConfirmedGroupRemoteCount(t *testing.T) {
+	ctx := context.Background()
+
+	multi := testkit.NewMultiNodes(t, log.DiscardLogger, []actor.Actor{&clusterKindActor{}}, nil)
+	multi.Start()
+	t.Cleanup(multi.Stop)
+
+	nodeA := multi.StartNode(ctx, "confirm-group-a")
+	nodeB := multi.StartNode(ctx, "confirm-group-b")
+
+	// A single Presence instance shared across both registries stands in for a real
+	// cluster-wide backend, so node B can enumerate the members node A holds.
+	presence := gateway.NewMemoryPresence()
+	registryA := gateway.NewRegistry(nodeA.ActorSystem(), log.DiscardLogger, gateway.WithPresence(presence))
+	registryB := gateway.NewRegistry(nodeB.ActorSystem(), log.DiscardLogger,
+		gateway.WithPresence(presence),
+		gateway.WithDeliveryConfirmation(),
+		gateway.WithConfirmationTimeout(3*time.Second),
+	)
+	t.Cleanup(func() { _ = registryA.Close(ctx); _ = registryB.Close(ctx) })
+
+	send := func([]byte) error { return nil }
+	require.NoError(t, registryA.Register(ctx, "gm-1", send, gateway.WithConnGroup("squad")))
+	require.NoError(t, registryA.Register(ctx, "gm-2", send, gateway.WithConnGroup("squad")))
+	time.Sleep(2 * time.Second)
+
+	result, err := registryB.SendToGroup(ctx, "squad", []byte("rally"))
+	require.NoError(t, err)
+	require.Equal(t, 0, result.Delivered)
+	require.Equal(t, 2, result.Remote)
 }

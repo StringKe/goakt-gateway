@@ -43,6 +43,7 @@ func BenchmarkManagerGetCertificateHot(b *testing.B) {
 	issuer := &fakeIssuer{ttl: time.Hour}
 	manager := gateway.NewManager(system, log.DiscardLogger,
 		gateway.WithCertIssuer(issuer),
+		gateway.WithAllowedDomains("bench.example.com"),
 		gateway.WithRenewInterval(""),
 		gateway.WithRenewBefore(time.Minute),
 	)
@@ -69,6 +70,7 @@ func BenchmarkTLSHandshake(b *testing.B) {
 	issuer := &fakeIssuer{ttl: time.Hour}
 	manager := gateway.NewManager(system, log.DiscardLogger,
 		gateway.WithCertIssuer(issuer),
+		gateway.WithAllowedDomains("bench.example.com"),
 		gateway.WithRenewInterval(""),
 		gateway.WithRenewBefore(time.Minute),
 	)

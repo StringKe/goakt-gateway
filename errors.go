@@ -75,6 +75,34 @@ var (
 	// held by someone else.
 	ErrLockNotAcquired = errors.New("gateway: lock not acquired")
 
+	// ErrOriginNotAllowed is returned by the WebSocket upgrade path when the request's
+	// Origin header matches none of the configured origin patterns.
+	ErrOriginNotAllowed = errors.New("gateway: websocket origin not allowed")
+
+	// ErrPayloadTooLarge tags an inbound message that exceeds the connection's configured
+	// read limit. The WebSocket handler does not return it: coder/websocket closes the
+	// socket with status 1009 (message too big) on its own, and the handler logs this
+	// sentinel as the reason. It is not delivered to any caller.
+	ErrPayloadTooLarge = errors.New("gateway: inbound payload exceeds the configured read limit")
+
+	// ErrRegistryClosed is returned by Registry.Register once the Registry has been closed.
+	ErrRegistryClosed = errors.New("gateway: registry is closed")
+
+	// ErrRateLimited tags an inbound message rejected by a connection's inbound rate limit.
+	// The WebSocket handler does not return it: it logs this sentinel and, under
+	// BackpressureClose, uses it as the socket's close reason. It is not delivered to any
+	// caller.
+	ErrRateLimited = errors.New("gateway: inbound message rate limit exceeded")
+
+	// ErrHistoryGap is returned by SSEHistory.Since when the requested Last-Event-ID
+	// cannot be located for the connection, because it was evicted from a bounded buffer,
+	// because it belongs to a different connection, or because the connection's history is
+	// gone entirely. The events that are still retained are returned alongside it: the
+	// caller learns both what it can replay and that something was lost. SSEHandler turns
+	// it into an SSEGapEventName event on the wire instead of silently resuming. It is part
+	// of the SSEHistory contract that third-party implementations must honour.
+	ErrHistoryGap = errors.New("gateway: sse history gap, the requested Last-Event-ID is no longer retained")
+
 	// ErrIssuanceLockExpired is returned by Manager when a CertIssuer call outlives the
 	// configured issuance lock TTL (see WithIssuanceLockTTL). The Coordinator lock has no
 	// renewal/heartbeat, so a slow issuer can let the lock expire and a second process
@@ -83,4 +111,28 @@ var (
 	// duplicate CertIssuer call. Configure a WithIssuanceLockTTL comfortably longer than
 	// your CertIssuer's worst-case latency to avoid it.
 	ErrIssuanceLockExpired = errors.New("gateway: certificate issuance took longer than the issuance lock ttl")
+
+	// ErrPresenceWatchUnsupported is returned by Registry.WatchPresence when no Presence
+	// backend is configured or the configured one does not implement PresenceWatcher.
+	ErrPresenceWatchUnsupported = errors.New("gateway: presence backend does not support Watch")
+
+	// ErrConfirmationTimeout is returned by the cross-node delivery path when
+	// WithDeliveryConfirmation is enabled and the remote connActor did not acknowledge the
+	// write within the configured confirmation timeout (see WithConfirmationTimeout).
+	ErrConfirmationTimeout = errors.New("gateway: cross-node delivery confirmation timed out")
+
+	// ErrStaleOwner is returned by an owner-lease-fenced operation (refresh, release, and
+	// (in later phases) delivery/presence/outbox calls that carry a connection generation)
+	// once a newer generation has taken over the connection. It tells the caller its
+	// generation is no longer current, not that the operation itself failed transiently.
+	ErrStaleOwner = errors.New("gateway: operation rejected: a newer generation has taken over this connection")
+
+	// ErrOwnerHeld is returned by a non-takeover owner lease acquisition when the lease is
+	// currently held by another node and has not yet expired.
+	ErrOwnerHeld = errors.New("gateway: connection owner lease is held by another node")
+
+	// ErrOwnerLeaseUnsupported is returned when WithOwnerLease is configured with a
+	// Coordinator that does not implement CASCoordinator: owner lease fencing requires an
+	// atomic compare-and-swap primitive that a plain Coordinator does not provide.
+	ErrOwnerLeaseUnsupported = errors.New("gateway: WithOwnerLease requires a Coordinator implementing CASCoordinator")
 )

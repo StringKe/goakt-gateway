@@ -23,6 +23,7 @@
 package gateway
 
 import (
+	"bytes"
 	"context"
 	"sync"
 	"time"
@@ -62,6 +63,27 @@ type Coordinator interface {
 	TryLock(ctx context.Context, key string, ttl time.Duration) (unlock func(context.Context) error, err error)
 }
 
+// CASCoordinator is an optional Coordinator extension that adds an atomic
+// compare-and-swap primitive. Implementations opt in by satisfying this interface (checked
+// with a type assertion, not embedded in Coordinator) so existing third-party Coordinator
+// implementations keep compiling unchanged; features that require it (e.g. WithOwnerLease)
+// fail fast with ErrOwnerLeaseUnsupported when the configured Coordinator does not
+// implement it.
+//
+// CompareAndSwap shares its key space with Get/Put: the "current value" a CAS call
+// compares against, and the value a successful CAS leaves behind, are exactly what Get
+// would return for that key.
+type CASCoordinator interface {
+	Coordinator
+
+	// CompareAndSwap atomically writes newValue (with the given ttl, same semantics as
+	// Put) under key if and only if the key's current value matches expected, and reports
+	// whether the swap happened. expected == nil requires the key to be absent or already
+	// expired; a non-nil expected requires an exact byte-for-byte match against the
+	// existing value. A failed comparison is not an error: it returns (false, nil).
+	CompareAndSwap(ctx context.Context, key string, expected, newValue []byte, ttl time.Duration) (bool, error)
+}
+
 // MemoryCoordinator is the default, in-process Coordinator. It is appropriate for a
 // single-node deployment, local development, and tests: TryLock/Put/Get only coordinate
 // callers within this process, so it gives Manager exactly the "issue once per process"
@@ -84,7 +106,10 @@ type memLock struct {
 }
 
 // enforce compilation error
-var _ Coordinator = (*MemoryCoordinator)(nil)
+var (
+	_ Coordinator    = (*MemoryCoordinator)(nil)
+	_ CASCoordinator = (*MemoryCoordinator)(nil)
+)
 
 // NewMemoryCoordinator creates an empty MemoryCoordinator.
 func NewMemoryCoordinator() *MemoryCoordinator {
@@ -108,6 +133,37 @@ func (m *MemoryCoordinator) Get(_ context.Context, key string) ([]byte, bool, er
 		return nil, false, nil
 	}
 	return append([]byte(nil), entry.value...), true, nil
+}
+
+// CompareAndSwap implements CASCoordinator. It shares MemoryCoordinator's entries map
+// with Get/Put (same key space, same lazy-expiry check) and performs the read-compare-write
+// under the same mutex, so it is atomic with respect to every other Coordinator method.
+func (m *MemoryCoordinator) CompareAndSwap(_ context.Context, key string, expected, newValue []byte, ttl time.Duration) (bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	entry, exists := m.entries[key]
+	if exists && !entry.expiresAt.IsZero() && time.Now().After(entry.expiresAt) {
+		delete(m.entries, key)
+		exists = false
+	}
+
+	var match bool
+	if expected == nil {
+		match = !exists
+	} else {
+		match = exists && bytes.Equal(entry.value, expected)
+	}
+	if !match {
+		return false, nil
+	}
+
+	var expiresAt time.Time
+	if ttl > 0 {
+		expiresAt = time.Now().Add(ttl)
+	}
+	m.entries[key] = memEntry{value: append([]byte(nil), newValue...), expiresAt: expiresAt}
+	return true, nil
 }
 
 // Put implements Coordinator.
