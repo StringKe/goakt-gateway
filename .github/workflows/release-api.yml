@@ -40,14 +40,19 @@ jobs:
           APIDIFF_VERSION: v0.0.0-20260709172345-9ea1abe57597
         run: |
           set -euo pipefail
+          raw_report="$RUNNER_TEMP/v0.1.0-to-current.raw.txt"
           report="$RUNNER_TEMP/v0.1.0-to-current.incompatible.txt"
-          go run "golang.org/x/exp/cmd/apidiff@${APIDIFF_VERSION}" -m -incompatible "$RUNNER_TEMP/v0.1.0.api" "$RUNNER_TEMP/current.api" | tee "$report"
+          go run "golang.org/x/exp/cmd/apidiff@${APIDIFF_VERSION}" -m -incompatible "$RUNNER_TEMP/v0.1.0.api" "$RUNNER_TEMP/current.api" > "$raw_report"
+          LC_ALL=C sort "$raw_report" > "$report"
+          cat "$report"
           if [[ "$GITHUB_REF_TYPE" == "tag" ]] && [[ "$GITHUB_REF_NAME" == v0.1.* ]] && [[ -s "$report" ]]; then
             echo "incompatible API changes require a v0.2.0 release" >&2
             exit 1
           fi
           approved=".github/api/v0.1.0-to-v0.2.0.incompatible.txt"
-          if ! cmp -s "$approved" "$report"; then
-            diff -u "$approved" "$report"
+          approved_report="$RUNNER_TEMP/v0.1.0-to-v0.2.0.incompatible.txt"
+          LC_ALL=C sort "$approved" > "$approved_report"
+          if ! cmp -s "$approved_report" "$report"; then
+            diff -u "$approved_report" "$report"
             exit 1
           fi
