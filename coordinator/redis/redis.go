@@ -38,9 +38,17 @@ import (
 	gateway "github.com/StringKe/goakt-gateway"
 )
 
-// lockSuffix separates a lock's key from the value key of the same name, so Put/Get and
-// TryLock never collide even when called with identical key strings.
-const lockSuffix = ":lock"
+// dataInfix and lockInfix place Put/Get values and TryLock locks in disjoint key
+// namespaces under the same configured prefix. They differ in their first byte and are
+// prepended before the caller's key, never appended after it, so no user-supplied key can
+// reproduce the other namespace: a Put on any key can never overwrite a lock's token or
+// clear its ttl, and acquiring a lock can never evict a stored value. A trailing suffix
+// (e.g. key+":lock") does not have this property - Put("x:lock") would collide with the
+// lock of TryLock("x") - which is why the discriminator is a leading infix instead.
+const (
+	dataInfix = "d:"
+	lockInfix = "l:"
+)
 
 // unlockScript performs a compare-and-delete: it only deletes the lock key if it still
 // holds the exact token this Coordinator's TryLock call set, so an unlock call can never
@@ -53,12 +61,51 @@ else
 end
 `)
 
+// casScript performs an atomic compare-and-swap in the "d:" data namespace: it GETs the
+// current value, checks it against the caller's expectation, and only then SETs the new
+// value - all inside one Redis command so no other client can observe or write between the
+// compare and the swap. ARGV[1] distinguishes "expected == nil" (require absent, ARGV[1]
+// == "0") from "expected == a value" (ARGV[1] == "1", compare against ARGV[2]) because Lua
+// cannot otherwise tell an empty-string expectation from a nil one. A missing Redis key
+// surfaces to Lua as the boolean false, never as an empty string, so it can never be
+// confused with a stored empty value.
+var casScript = goredis.NewScript(`
+local current = redis.call("GET", KEYS[1])
+if ARGV[1] == "1" then
+	if current == false or current ~= ARGV[2] then
+		return 0
+	end
+else
+	if current ~= false then
+		return 0
+	end
+end
+if tonumber(ARGV[4]) > 0 then
+	redis.call("SET", KEYS[1], ARGV[3], "PX", ARGV[4])
+else
+	redis.call("SET", KEYS[1], ARGV[3])
+end
+return 1
+`)
+
 // Coordinator is a gateway.Coordinator backed by a Redis client: Put/Get use plain
-// SET/GET with the given TTL, and TryLock uses SET NX PX for acquisition and the Lua
-// script above for release - a real mutual exclusion primitive, unlike a best-effort
-// distributed lock.
+// SET/GET with the given TTL, TryLock uses SET NX PX for acquisition and the Lua script
+// above for release, and CompareAndSwap uses the Lua script above for an atomic
+// read-compare-write - real mutual exclusion and CAS primitives, unlike best-effort
+// distributed locking.
+//
+// TryLock's mutual exclusion, and CompareAndSwap's atomicity, hold against every client
+// talking to the same Redis primary. They do not survive a Redis failover: SET NX PX (and
+// this CAS script) only excludes other callers on the primary that accepted the write: if
+// that primary fails before the write reaches a replica and a replica is promoted, the new
+// primary has no record of it and a second caller can acquire the same lock or win the same
+// CAS again. This is a fundamental limitation of single-primary Redis with asynchronous
+// replication, not something a client-side Coordinator can close: a deployment that needs a
+// lock/CAS to survive failover without any repeat-grant window needs a consensus-backed
+// store (e.g. Redlock across independent Redis primaries, or etcd/ZooKeeper), which is
+// outside the scope of this package.
 type Coordinator struct {
-	client goredis.Cmdable
+	client goredis.UniversalClient
 	prefix string
 }
 
@@ -73,8 +120,8 @@ func WithKeyPrefix(prefix string) Option {
 }
 
 // New creates a Coordinator backed by client. client may be a *redis.Client,
-// *redis.ClusterClient, or any other goredis.Cmdable implementation.
-func New(client goredis.Cmdable, opts ...Option) *Coordinator {
+// *redis.ClusterClient, *redis.Ring, or any other goredis.UniversalClient implementation.
+func New(client goredis.UniversalClient, opts ...Option) *Coordinator {
 	c := &Coordinator{client: client}
 	for _, opt := range opts {
 		opt(c)
@@ -83,15 +130,22 @@ func New(client goredis.Cmdable, opts ...Option) *Coordinator {
 }
 
 // enforce compilation error
-var _ gateway.Coordinator = (*Coordinator)(nil)
+var (
+	_ gateway.Coordinator    = (*Coordinator)(nil)
+	_ gateway.CASCoordinator = (*Coordinator)(nil)
+)
 
-func (c *Coordinator) key(key string) string {
-	return c.prefix + key
+func (c *Coordinator) dataKey(key string) string {
+	return c.prefix + dataInfix + key
+}
+
+func (c *Coordinator) lockKey(key string) string {
+	return c.prefix + lockInfix + key
 }
 
 // Get implements gateway.Coordinator.
 func (c *Coordinator) Get(ctx context.Context, key string) ([]byte, bool, error) {
-	value, err := c.client.Get(ctx, c.key(key)).Bytes()
+	value, err := c.client.Get(ctx, c.dataKey(key)).Bytes()
 	if errors.Is(err, goredis.Nil) {
 		return nil, false, nil
 	}
@@ -103,16 +157,37 @@ func (c *Coordinator) Get(ctx context.Context, key string) ([]byte, bool, error)
 
 // Put implements gateway.Coordinator.
 func (c *Coordinator) Put(ctx context.Context, key string, value []byte, ttl time.Duration) error {
-	var expiration time.Duration
-	if ttl > 0 {
-		expiration = ttl
+	return c.client.Set(ctx, c.dataKey(key), value, max(ttl, 0)).Err()
+}
+
+// CompareAndSwap implements gateway.CASCoordinator, in the same "d:" data namespace Get/Put
+// use, via casScript.
+func (c *Coordinator) CompareAndSwap(ctx context.Context, key string, expected, newValue []byte, ttl time.Duration) (bool, error) {
+	hasExpected := "0"
+	var expectedArg any = ""
+	if expected != nil {
+		hasExpected = "1"
+		expectedArg = expected
 	}
-	return c.client.Set(ctx, c.key(key), value, expiration).Err()
+
+	// ttl.Milliseconds() rounds a sub-millisecond positive ttl down to 0, which the script
+	// reads as "never expires" (tonumber(ARGV[4]) > 0 is false) - the opposite of what a
+	// caller who passed ttl > 0 asked for. Floor it at 1ms instead of letting that happen.
+	ttlMs := int64(0)
+	if ttl > 0 {
+		ttlMs = max(ttl.Milliseconds(), 1)
+	}
+
+	res, err := casScript.Run(ctx, c.client, []string{c.dataKey(key)}, hasExpected, expectedArg, newValue, ttlMs).Int()
+	if err != nil {
+		return false, err
+	}
+	return res == 1, nil
 }
 
 // TryLock implements gateway.Coordinator.
 func (c *Coordinator) TryLock(ctx context.Context, key string, ttl time.Duration) (func(context.Context) error, error) {
-	lockKey := c.key(key) + lockSuffix
+	lockKey := c.lockKey(key)
 	token := uuid.NewString()
 
 	acquired, err := c.client.SetNX(ctx, lockKey, token, ttl).Result()

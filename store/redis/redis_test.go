@@ -23,7 +23,7 @@
 // This suite requires a real Redis instance and is skipped unless TEST_REDIS_ADDR is
 // set, so CI does not need a Redis daemon by default:
 //
-//	TEST_REDIS_ADDR=localhost:6379 go test ./coordinator/redis/...
+//	TEST_REDIS_ADDR=localhost:6379 go test ./store/redis/...
 package redis_test
 
 import (
@@ -32,20 +32,19 @@ import (
 	"os"
 	"sync/atomic"
 	"testing"
-	"time"
 
 	"github.com/redis/go-redis/v9"
 	"github.com/stretchr/testify/require"
 
 	gateway "github.com/StringKe/goakt-gateway"
-	"github.com/StringKe/goakt-gateway/coordinator/conformance"
-	gatewayredis "github.com/StringKe/goakt-gateway/coordinator/redis"
+	"github.com/StringKe/goakt-gateway/store/conformance"
+	gatewayredis "github.com/StringKe/goakt-gateway/store/redis"
 )
 
-func TestRedisCoordinatorConformance(t *testing.T) {
+func TestRedisCertStoreConformance(t *testing.T) {
 	addr := os.Getenv("TEST_REDIS_ADDR")
 	if addr == "" {
-		t.Skip("TEST_REDIS_ADDR not set; skipping Redis-backed Coordinator conformance suite")
+		t.Skip("TEST_REDIS_ADDR not set; skipping Redis-backed CertStore conformance suite")
 	}
 
 	client := redis.NewClient(&redis.Options{Addr: addr})
@@ -53,34 +52,10 @@ func TestRedisCoordinatorConformance(t *testing.T) {
 	require.NoError(t, client.Ping(context.Background()).Err(), "failed to reach Redis at TEST_REDIS_ADDR")
 
 	var counter atomic.Int64
-	conformance.Run(t, func(*testing.T) gateway.Coordinator {
+	conformance.Run(t, func() gateway.CertStore {
 		// each subtest gets its own key namespace so state never leaks between them
 		// despite sharing one Redis instance.
 		prefix := fmt.Sprintf("goakt-gateway-test-%d:", counter.Add(1))
-		return gatewayredis.New(client, gatewayredis.WithKeyPrefix(prefix))
-	})
-}
-
-func TestRedisCoordinatorCASConformance(t *testing.T) {
-	addr := os.Getenv("TEST_REDIS_ADDR")
-	if addr == "" {
-		t.Skip("TEST_REDIS_ADDR not set; skipping Redis-backed Coordinator CAS conformance suite")
-	}
-
-	client := redis.NewClient(&redis.Options{Addr: addr})
-	t.Cleanup(func() { _ = client.Close() })
-	require.NoError(t, client.Ping(context.Background()).Err(), "failed to reach Redis at TEST_REDIS_ADDR")
-
-	// Unlike Run's subtests, several RunCAS subtests assert a key is truly absent (that is
-	// the whole point of testing expected == nil), so a prefix that repeats across separate
-	// `go test` invocations against the same long-lived Redis instance would collide with a
-	// ttl=0 key a prior run left behind. Seeding with the process start time keeps every
-	// run's prefixes disjoint from every other run's, on top of the per-subtest counter that
-	// already keeps them disjoint within one run.
-	runSeed := time.Now().UnixNano()
-	var counter atomic.Int64
-	conformance.RunCAS(t, func(*testing.T) gateway.CASCoordinator {
-		prefix := fmt.Sprintf("goakt-gateway-cas-test-%d-%d:", runSeed, counter.Add(1))
 		return gatewayredis.New(client, gatewayredis.WithKeyPrefix(prefix))
 	})
 }
