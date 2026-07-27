@@ -9,7 +9,7 @@ require (
 	github.com/redis/go-redis/v9 v9.21.0
 	github.com/reugn/go-quartz v0.15.2
 	github.com/stretchr/testify v1.11.1
-	github.com/tochemey/goakt/v4 v4.4.0
+	github.com/tochemey/goakt/v4 v4.4.2
 	go.opentelemetry.io/otel v1.44.0
 	go.opentelemetry.io/otel/metric v1.44.0
 	go.opentelemetry.io/otel/sdk/metric v1.44.0
@@ -20,7 +20,7 @@ require (
 )
 
 require (
-	github.com/RoaringBitmap/roaring/v2 v2.21.0 // indirect
+	github.com/RoaringBitmap/roaring/v2 v2.24.0 // indirect
 	github.com/Workiva/go-datastructures v1.1.7 // indirect
 	github.com/andybalholm/brotli v1.2.2 // indirect
 	github.com/antithesishq/antithesis-sdk-go v0.7.2 // indirect
@@ -35,7 +35,7 @@ require (
 	github.com/deckarep/golang-set/v2 v2.9.0 // indirect
 	github.com/flowchartsman/retry v1.2.0 // indirect
 	github.com/fxamacker/cbor/v2 v2.9.2 // indirect
-	github.com/go-logr/logr v1.4.3 // indirect
+	github.com/go-logr/logr v1.4.4 // indirect
 	github.com/go-logr/stdr v1.2.2 // indirect
 	github.com/golang-jwt/jwt/v5 v5.2.1 // indirect
 	github.com/google/btree v1.1.3 // indirect
@@ -49,7 +49,7 @@ require (
 	github.com/hashicorp/golang-lru v1.0.2 // indirect
 	github.com/hashicorp/logutils v1.0.0 // indirect
 	github.com/hashicorp/memberlist v0.6.0 // indirect
-	github.com/klauspost/compress v1.19.0 // indirect
+	github.com/klauspost/compress v1.19.1 // indirect
 	github.com/klauspost/cpuid/v2 v2.4.0 // indirect
 	github.com/miekg/dns v1.1.72 // indirect
 	github.com/minio/highwayhash v1.0.4 // indirect
@@ -64,7 +64,7 @@ require (
 	github.com/sean-/seed v0.0.0-20170313163322-e2103e2c3529 // indirect
 	github.com/tidwall/btree v1.8.1 // indirect
 	github.com/tidwall/match v1.2.0 // indirect
-	github.com/tidwall/redcon v1.6.2 // indirect
+	github.com/tidwall/redcon v1.6.4 // indirect
 	github.com/tochemey/olric v0.3.17 // indirect
 	github.com/twitchyliquid64/golang-asm v0.15.1 // indirect
 	github.com/vmihailenco/msgpack/v5 v5.4.1 // indirect
